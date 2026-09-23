@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MAX_INK_POINTS, annotationMetadata, annotationsForPage, appendInkPoint, characterHitTest, clampPressure, createAnnotationId, inkSegments, normalizeAnnotation, normalizeTextRange, orderAnnotations, pressureStrokeWidth, selectionRangeGeometry } from "./annotations";
+import { MAX_INK_POINTS, annotationMetadata, annotationsForPage, appendInkPoint, characterHitTest, clampPressure, createAnnotationId, inkSegments, normalizeAnnotation, normalizeTextRange, orderAnnotations, pressureStrokeWidth, selectionContainsPoint, selectionRangeGeometry } from "./annotations";
 import type { InkPoint } from "./annotations";
 import type { SearchPageText } from "./search";
 
@@ -77,14 +77,26 @@ describe("character selection geometry", () => {
     expect(geometry?.rects[0]?.width).toBeCloseTo(0.15);
     expect(geometry?.rects[1]).toMatchObject({ x: 0.4, y: 0.1, height: 0.1 });
     expect(geometry?.rects[1]?.width).toBeCloseTo(0.15);
-    expect(geometry?.startHandle).toEqual({ x: 0.2, y: 0.2 });
-    expect(geometry?.endHandle).toEqual({ x: 0.55, y: 0.2 });
+    expect(geometry?.startHandle).toEqual({ x: 0.2, y: 0.1, height: 0.1 });
+    expect(geometry?.endHandle?.y).toBe(0.1);
+    expect(geometry?.endHandle?.height).toBe(0.1);
+    expect(geometry?.endHandle?.x).toBeCloseTo(0.55);
     expect(geometry?.text).toBe("llo wor");
     expect(geometry?.context).toContain("llo wor");
   });
 
   it("returns no geometry for a caret-only or empty selection", () => {
     expect(selectionRangeGeometry(page, { itemIndex: 0, offset: 2 }, { itemIndex: 0, offset: 2 })).toBeUndefined();
+  });
+
+  it("hit-tests points against the selection rectangles, handles, and pad", () => {
+    const geometry = selectionRangeGeometry(page, { itemIndex: 0, offset: 2 }, { itemIndex: 1, offset: 3 }, 2);
+    if (!geometry) throw new Error("expected selection geometry");
+    expect(selectionContainsPoint(geometry, { x: 0.25, y: 0.15 })).toBe(true);
+    expect(selectionContainsPoint(geometry, { x: 0.9, y: 0.9 })).toBe(false);
+    expect(selectionContainsPoint(geometry, { x: 0.25, y: 0.205 })).toBe(false);
+    expect(selectionContainsPoint(geometry, { x: 0.25, y: 0.205 }, 0.02, 0.02)).toBe(true);
+    expect(selectionContainsPoint(geometry, { x: Number.NaN, y: 0.15 })).toBe(false);
   });
 });
 

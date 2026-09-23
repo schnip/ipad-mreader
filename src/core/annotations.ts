@@ -60,11 +60,20 @@ export interface TextRange {
   end: TextPosition;
 }
 
+/**
+ * Normalized anchor for one selection handle. `x`/`y` is the top edge of the
+ * text line at that selection edge and `height` is that line's height, so an
+ * adapter can draw a caret bar aligned with the line instead of beneath it.
+ */
+export interface SelectionHandleAnchor extends NormalizedPoint {
+  height: number;
+}
+
 export interface SelectionGeometry {
   range: TextRange;
   rects: NormalizedRect[];
-  startHandle: NormalizedPoint;
-  endHandle: NormalizedPoint;
+  startHandle: SelectionHandleAnchor;
+  endHandle: SelectionHandleAnchor;
   text: string;
   context: string;
 }
@@ -220,11 +229,34 @@ export function selectionRangeGeometry(page: SearchPageText, first: TextPosition
   return {
     range,
     rects: validRects,
-    startHandle: { x: firstRect.x, y: firstRect.y + firstRect.height },
-    endHandle: { x: lastRect.x + lastRect.width, y: lastRect.y + lastRect.height },
+    startHandle: { x: firstRect.x, y: firstRect.y, height: firstRect.height },
+    endHandle: { x: lastRect.x + lastRect.width, y: lastRect.y, height: lastRect.height },
     text: selected.join(" "),
     context: `${contextFrom > 0 ? "…" : ""}${complete.slice(contextFrom, contextTo).trim()}${contextTo < complete.length ? "…" : ""}`
   };
+}
+
+/**
+ * Whether a normalized page point falls within the selection, allowing a small
+ * normalized pad so a fingertip does not have to land on a glyph exactly. The
+ * handle anchors count as inside, which keeps their carets grabbable even when
+ * the selection ends at a page edge.
+ */
+export function selectionContainsPoint(geometry: SelectionGeometry, point: NormalizedPoint, padX = 0, padY = 0): boolean {
+  const x = finite(point?.x, Number.NaN);
+  const y = finite(point?.y, Number.NaN);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+  const horizontal = Math.max(0, finite(padX, 0));
+  const vertical = Math.max(0, finite(padY, 0));
+  const withinRect = geometry.rects.some((rect) => x >= rect.x - horizontal
+    && x <= rect.x + rect.width + horizontal
+    && y >= rect.y - vertical
+    && y <= rect.y + rect.height + vertical);
+  if (withinRect) return true;
+  return [geometry.startHandle, geometry.endHandle].some((handle) => x >= handle.x - horizontal
+    && x <= handle.x + horizontal
+    && y >= handle.y - vertical
+    && y <= handle.y + handle.height + vertical);
 }
 
 export function clampPressure(pressure: number): number {

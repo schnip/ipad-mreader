@@ -20,7 +20,7 @@ import { flattenOutline, outlineTreeStructure } from "./core/outline";
 import type { FlatOutlineItem, OutlineTreeItem, PdfOutlineNode } from "./core/outline";
 import { SearchGeneration, normalizeSearchText, searchPages } from "./core/search";
 import type { SearchHit, SearchPageText } from "./core/search";
-import { DEFAULT_HIGHLIGHT_COLOR, DEFAULT_INK_COLOR, DEFAULT_NOTE_COLOR, annotationMetadata, annotationsForPage, appendInkPoint, characterHitTest, inkSegments, normalizeAnnotation, orderAnnotations, selectionRangeGeometry } from "./core/annotations";
+import { DEFAULT_HIGHLIGHT_COLOR, DEFAULT_INK_COLOR, DEFAULT_NOTE_COLOR, annotationMetadata, annotationsForPage, appendInkPoint, characterHitTest, inkSegments, normalizeAnnotation, orderAnnotations, selectionContainsPoint, selectionRangeGeometry } from "./core/annotations";
 import type { Annotation, InkPoint, NormalizedPoint, NoteAnnotation, SelectionGeometry, TextPosition } from "./core/annotations";
 import { deletePdf, importPdf, listPdfs, readPdf } from "./store/opfs";
 import { dedupeRecentDocuments, defaultReadingPosition, deleteDocumentSidecar, listRecentDocuments, putDocumentSidecar, updateReadingPosition } from "./store/sidecar";
@@ -87,6 +87,7 @@ interface LiveInkSurface {
 }
 
 const TAP_MOVEMENT = 10;
+const SELECTION_TOUCH_PAD = 0.012;
 const INK_BASE_WIDTH = 2.2;
 export class ReaderApplication {
   private readonly scene: HTMLElement;
@@ -183,6 +184,8 @@ export class ReaderApplication {
   private annotationOverlayGeneration = 0;
   private selection?: TextSelectionState;
   private selectionTouch?: SelectionTouch;
+  private pendingSelectionDismissal?: TextSelectionState;
+  private readonly selectionHandles = new Map<"start" | "end", HTMLButtonElement>();
   private longPressTimer?: number;
   private longPressGeneration = 0;
   private ink?: InkState;
@@ -298,6 +301,7 @@ export class ReaderApplication {
             <div id="drawer-content" class="drawer-content"></div>
           </section>
           <div id="selection-actions" class="selection-actions reader-control" data-reader-control role="toolbar" aria-label="Text selection actions" hidden>
+            <button id="selection-copy" type="button">Copy</button>
             <button id="selection-highlight" type="button">Highlight</button>
             <button id="selection-note" type="button">Add note</button>
             <button id="selection-cancel" type="button">Cancel</button>
@@ -347,6 +351,7 @@ export class ReaderApplication {
     this.drawerContent.addEventListener("click", (event) => void this.onDrawerAction(event));
     this.pageAnnotationLayer.addEventListener("click", (event) => this.onAnnotationLayerAction(event));
     this.continuousAnnotationLayer.addEventListener("click", (event) => this.onAnnotationLayerAction(event));
+    required<HTMLButtonElement>(this.root, "#selection-copy").addEventListener("click", () => void this.copySelection());
     required<HTMLButtonElement>(this.root, "#selection-highlight").addEventListener("click", () => void this.createHighlight());
     required<HTMLButtonElement>(this.root, "#selection-note").addEventListener("click", () => this.openNoteEditor());
     required<HTMLButtonElement>(this.root, "#selection-cancel").addEventListener("click", () => this.cancelSelection());
@@ -839,12 +844,15 @@ export class ReaderApplication {
       if (!point) return;
       if (this.selection) {
         const hit = this.pageHitAt(point);
-        if (hit?.pageNumber === this.selection.pageNumber) {
+        const insideSelection = hit?.pageNumber === this.selection.pageNumber
+          && selectionContainsPoint(this.selection.geometry, hit.normalized, SELECTION_TOUCH_PAD, SELECTION_TOUCH_PAD);
+        if (insideSelection && hit) {
           event.preventDefault();
           this.selectionTouch = { mode: "extend", pageNumber: hit.pageNumber };
           void this.updateSelectionAt(point, "extend");
+          return;
         }
-        return;
+        this.pendingSelectionDismissal = this.selection;
       }
       const now = performance.now();
       if (this.pendingChromeTimer !== undefined
@@ -934,6 +942,7 @@ export class ReaderApplication {
     if (Math.hypot(delta.x, delta.y) >= 8) {
       this.clearPendingTap();
       this.cancelLongPress();
+      this.applyPendingSelectionDismissal();
     }
     this.singleTouch.latest = current;
     this.singleTouch.lastMovedAt = movedAt;
@@ -1057,6 +1066,7 @@ export class ReaderApplication {
     this.cancelLongPress();
     event.preventDefault();
     this.singleTouch = undefined;
+    const dismissedSelection = this.applyPendingSelectionDismissal();
     const deltaX = touch.latest.x - touch.start.x;
     const deltaY = touch.latest.y - touch.start.y;
     const endedAt = performance.now();
@@ -1082,7 +1092,7 @@ export class ReaderApplication {
     }
     if (this.layoutMode === "continuous") {
       if (touch.intent === "undecided" && distance(touch.start, touch.latest) <= TAP_MOVEMENT && elapsedMs < 400) {
-        await this.handleTap({ at: performance.now(), point: touch.latest });
+        if (!dismissedSelection) await this.handleTap({ at: performance.now(), point: touch.latest });
       } else if (touch.intent === "continuous-pan") {
         if (!this.startContinuousMomentum(touch.continuousVelocity)) {
           await this.refreshContinuousRendering();
@@ -1092,7 +1102,7 @@ export class ReaderApplication {
       return;
     }
     if (touch.intent === "undecided" && distance(touch.start, touch.latest) <= TAP_MOVEMENT && elapsedMs < 400) {
-      await this.handleTap({ at: performance.now(), point: touch.latest });
+      if (!dismissedSelection) await this.handleTap({ at: performance.now(), point: touch.latest });
       return;
     }
     const direction = touch.intent === "page-turn" ? release.direction : 0;
@@ -1109,6 +1119,7 @@ export class ReaderApplication {
     this.cancelTouches();
     this.cancelLongPress();
     this.selectionTouch = undefined;
+    this.pendingSelectionDismissal = undefined;
   }
 
   private startBufferedPageTouch(event: TouchEvent): void {
@@ -2134,6 +2145,7 @@ export class ReaderApplication {
         geometry
       };
       this.selectionTouch = { mode: "extend", pageNumber: hit.pageNumber };
+      this.pendingSelectionDismissal = undefined;
       this.clearPendingTap();
       this.refreshAnnotationOverlays();
     } catch (error) {
@@ -2179,10 +2191,25 @@ export class ReaderApplication {
   }
 
   private cancelSelection(): void {
+    this.pendingSelectionDismissal = undefined;
     this.selection = undefined;
     this.selectionTouch = undefined;
     this.selectionActions.hidden = true;
     this.refreshAnnotationOverlays();
+  }
+
+  /**
+   * A gesture that begins away from the selection dismisses it. A tap clears the
+   * selection and is consumed so it does not also toggle chrome or navigate, and
+   * a drag clears it the moment the drag is recognized so the overlay never
+   * floats over a moving page. Returns whether a dismissal happened.
+   */
+  private applyPendingSelectionDismissal(): boolean {
+    const pending = this.pendingSelectionDismissal;
+    this.pendingSelectionDismissal = undefined;
+    if (!pending || this.selection !== pending) return false;
+    this.cancelSelection();
+    return true;
   }
 
   private cancelAnnotationInteraction(): void {
@@ -2190,6 +2217,18 @@ export class ReaderApplication {
     this.cancelSelection();
     this.cancelInk();
     this.closeNoteEditor(false);
+  }
+
+  private async copySelection(): Promise<void> {
+    const text = this.selection?.geometry.text.trim();
+    if (!text) return;
+    const copied = await writeClipboardText(text);
+    if (!copied) {
+      this.showStatus("Copying text is unavailable here.", true, 2000);
+      return;
+    }
+    this.showStatus("Copied selected text.", false, 1400);
+    this.cancelSelection();
   }
 
   private async createHighlight(): Promise<void> {
@@ -2380,16 +2419,31 @@ export class ReaderApplication {
       marker.style.height = `${rect.height * layout.height}px`;
       layer.append(marker);
     }
-    for (const [kind, point] of [["start", selection.geometry.startHandle], ["end", selection.geometry.endHandle]] as const) {
-      const handle = documentElement("button", `selection-handle ${kind}`);
-      handle.type = "button";
-      handle.dataset.readerControl = "";
-      handle.dataset.selectionHandle = kind;
-      handle.setAttribute("aria-label", `Adjust ${kind} of selection`);
-      handle.style.left = `${layout.x + point.x * layout.width}px`;
-      handle.style.top = `${layout.y + point.y * layout.height}px`;
+    for (const [kind, anchor] of [["start", selection.geometry.startHandle], ["end", selection.geometry.endHandle]] as const) {
+      const handle = this.selectionHandle(kind);
+      handle.style.left = `${layout.x + anchor.x * layout.width}px`;
+      handle.style.top = `${layout.y + anchor.y * layout.height}px`;
+      handle.style.setProperty("--selection-handle-line", `${Math.max(12, anchor.height * layout.height)}px`);
       layer.append(handle);
     }
+  }
+
+  /**
+   * Selection handles are reused rather than recreated. A touch keeps its
+   * original target element for the whole gesture, so rebuilding a handle while
+   * it is being dragged would detach that target and stop every later touchmove
+   * from reaching the scene listener.
+   */
+  private selectionHandle(kind: "start" | "end"): HTMLButtonElement {
+    const existing = this.selectionHandles.get(kind);
+    if (existing) return existing;
+    const handle = documentElement("button", `selection-handle ${kind}`);
+    handle.type = "button";
+    handle.dataset.readerControl = "";
+    handle.dataset.selectionHandle = kind;
+    handle.setAttribute("aria-label", `Adjust ${kind} of selection`);
+    this.selectionHandles.set(kind, handle);
+    return handle;
   }
 
   private renderInk(points: readonly InkPoint[], color: string, baseWidth: number, layout: PageLayout, layer: HTMLElement, className: string): void {
@@ -3204,6 +3258,36 @@ function renderOutlineList(items: readonly OutlineTreeItem[], indexes: ReadonlyM
     list.append(row);
   }
   return list;
+}
+
+/**
+ * Copies text using the async clipboard when available, falling back to a
+ * transient off-screen textarea for Safari configurations that reject
+ * `navigator.clipboard` writes. Returns whether the copy succeeded.
+ */
+async function writeClipboardText(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fall through to the legacy selection-based copy path.
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;-webkit-user-select:text;user-select:text";
+  document.body.append(area);
+  try {
+    area.select();
+    area.setSelectionRange(0, text.length);
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  } finally {
+    area.remove();
+  }
 }
 
 function touchPoint(touch: Touch | undefined): Point | undefined {

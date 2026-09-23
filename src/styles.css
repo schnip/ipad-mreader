@@ -110,8 +110,7 @@ button { touch-action: none; }
 
 .annotation-ink.live { opacity: 0.86; }
 
-.annotation-note-button,
-.selection-handle {
+.annotation-note-button {
   position: absolute;
   z-index: 1;
   width: 36px;
@@ -129,24 +128,48 @@ button { touch-action: none; }
   box-shadow: 0 2px 8px rgb(0 0 0 / 35%);
 }
 
+/*
+ * The handle box is a 44-point touch target centred on the line edge:
+ * --selection-handle-line carries the measured line height, the ::before bar
+ * covers exactly that line, and the ::after knob sits above the line for the
+ * start handle and below it for the end handle.
+ */
 .selection-handle {
+  position: absolute;
+  z-index: 1;
   width: 44px;
-  height: 44px;
-  margin: -8px 0 0 -22px;
+  height: calc(var(--selection-handle-line, 18px) + 32px);
+  margin: -16px 0 0 -22px;
+  border: 0;
+  padding: 0;
   background: transparent;
+  pointer-events: auto;
+  touch-action: none;
 }
 
 .selection-handle::before {
   position: absolute;
-  top: 4px;
-  left: 18px;
-  width: 8px;
-  height: 28px;
-  border-radius: 5px;
+  top: 16px;
+  left: 20px;
+  width: 4px;
+  height: var(--selection-handle-line, 18px);
+  background: #4a9dff;
+  content: "";
+}
+
+.selection-handle::after {
+  position: absolute;
+  left: 15px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
   background: #4a9dff;
   box-shadow: 0 1px 4px rgb(0 0 0 / 35%);
   content: "";
 }
+
+.selection-handle.start::after { top: 2px; }
+.selection-handle.end::after { bottom: 2px; }
 
 .selection-actions {
   position: fixed;

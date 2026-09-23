@@ -1,4 +1,4 @@
-const CACHE = "mreader-p5-v1";
+const CACHE = "mreader-p5-v3";
 const CORE = ["./", "./manifest.webmanifest", "./icon.svg"];
 
 self.addEventListener("install", (event) => {
