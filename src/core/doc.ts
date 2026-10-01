@@ -1,9 +1,11 @@
-import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
+import { AnnotationType, GlobalWorkerOptions, getDocument } from "pdfjs-dist";
 import type { PDFDocumentLoadingTask, PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import type { Size } from "./layout";
 import { destinationTarget } from "./outline";
 import type { PdfOutlineNode } from "./outline";
+import { extractPdfLinks } from "./links";
+import type { PdfLink } from "./links";
 import { transformedTextBounds } from "./search";
 import type { SearchPageText, SearchTextItem } from "./search";
 
@@ -32,7 +34,7 @@ export class PdfPageHandle {
 
   render(canvas: HTMLCanvasElement, scale: number, dpr: number): PdfRenderJob {
     const viewport = this.page.getViewport({ scale });
-    const pixelRatio = Math.max(1, dpr);
+    const pixelRatio = Math.max(0.5, dpr);
     canvas.width = Math.max(1, Math.ceil(viewport.width * pixelRatio));
     canvas.height = Math.max(1, Math.ceil(viewport.height * pixelRatio));
     const context = canvas.getContext("2d", { alpha: false });
@@ -55,6 +57,7 @@ export class PdfDocument {
   private static readonly maximumRetainedPages = 12;
   private readonly pages = new Map<number, Promise<PdfPageHandle>>();
   private readonly sizes = new Map<number, Size>();
+  private readonly links = new Map<number, Promise<PdfLink[]>>();
 
   private constructor(
     readonly descriptor: PdfDescriptor,
@@ -146,6 +149,23 @@ export class PdfDocument {
     return (outline ?? []).map(mapOutlineNode);
   }
 
+  pageLinks(pageNumber: number): Promise<PdfLink[]> {
+    this.assertPageNumber(pageNumber);
+    const existing = this.links.get(pageNumber);
+    if (existing) return existing;
+    const pending = this.document.getPage(pageNumber).then(async (page) => {
+      try {
+        const viewport = page.getViewport({ scale: 1 });
+        return extractPdfLinks(await page.getAnnotations({ intent: "display" }), AnnotationType.LINK, viewport);
+      } finally {
+        page.cleanup();
+      }
+    });
+    this.links.set(pageNumber, pending);
+    void pending.catch(() => this.links.delete(pageNumber));
+    return pending;
+  }
+
   async resolveDestination(destination: unknown): Promise<number | undefined> {
     const resolved = typeof destination === "string" ? await this.document.getDestination(destination) : destination;
     const target = destinationTarget(resolved);
@@ -167,6 +187,7 @@ export class PdfDocument {
     }
     this.pages.clear();
     this.sizes.clear();
+    this.links.clear();
     await this.loadingTask.destroy();
   }
 

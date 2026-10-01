@@ -82,6 +82,34 @@ button { touch-action: none; }
   user-select: none;
 }
 
+.link-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  user-select: none;
+}
+
+.pdf-link {
+  position: absolute;
+  z-index: 0;
+  min-width: 1px;
+  min-height: 1px;
+  border: 0;
+  border-radius: 2px;
+  padding: 0;
+  background: transparent;
+  pointer-events: auto;
+  touch-action: none;
+}
+
+.pdf-link:focus-visible {
+  outline: 2px solid rgb(74 157 255 / 92%);
+  outline-offset: 1px;
+  background: rgb(74 157 255 / 16%);
+}
+
+.reader-scene[data-view="grid"] .pdf-link { pointer-events: none; }
+
 .annotation-layer {
   position: absolute;
   inset: 0;
@@ -226,6 +254,19 @@ button { touch-action: none; }
 .thumbnail-page.focused {
   outline-width: 2px;
   outline-offset: 3px;
+}
+
+.thumbnail-page-number {
+  position: absolute;
+  overflow: hidden;
+  color: rgb(232 234 239 / 78%);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 10px;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
 }
 
 .page-track.semantic-settling,

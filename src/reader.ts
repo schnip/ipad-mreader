@@ -18,10 +18,13 @@ import type { ThumbnailRenderSpec } from "./core/thumbs";
 import { isViewControlActive } from "./core/view-controls";
 import { flattenOutline, outlineTreeStructure } from "./core/outline";
 import type { FlatOutlineItem, OutlineTreeItem, PdfOutlineNode } from "./core/outline";
+import { pageForPdfAction } from "./core/links";
+import type { PdfLink, PdfLinkAction } from "./core/links";
 import { SearchGeneration, normalizeSearchText, searchPages } from "./core/search";
 import type { SearchHit, SearchPageText } from "./core/search";
 import { DEFAULT_HIGHLIGHT_COLOR, DEFAULT_INK_COLOR, DEFAULT_NOTE_COLOR, annotationMetadata, annotationsForPage, appendInkPoint, characterHitTest, inkSegments, normalizeAnnotation, orderAnnotations, selectionContainsPoint, selectionRangeGeometry } from "./core/annotations";
 import type { Annotation, InkPoint, NormalizedPoint, NoteAnnotation, SelectionGeometry, TextPosition } from "./core/annotations";
+import { exportAnnotatedPdf } from "./core/export";
 import { deletePdf, importPdf, listPdfs, readPdf } from "./store/opfs";
 import { dedupeRecentDocuments, defaultReadingPosition, deleteDocumentSidecar, listRecentDocuments, putDocumentSidecar, updateReadingPosition } from "./store/sidecar";
 import type { DocumentSidecar, FitState, ReadingPosition } from "./store/sidecar";
@@ -86,6 +89,24 @@ interface LiveInkSurface {
   renderedPointCount: number;
 }
 
+interface FileLaunchParams {
+  files?: readonly FileSystemFileHandle[];
+}
+
+interface FileLaunchQueue {
+  setConsumer(consumer: (params: FileLaunchParams) => void): void;
+}
+
+interface SharedTargetRequest {
+  id?: string;
+  error?: string;
+}
+
+interface VisiblePdfLink {
+  link: PdfLink;
+  sourcePage: number;
+}
+
 const TAP_MOVEMENT = 10;
 const SELECTION_TOUCH_PAD = 0.012;
 const INK_BASE_WIDTH = 2.2;
@@ -96,6 +117,8 @@ export class ReaderApplication {
   private readonly continuousLayer: HTMLElement;
   private readonly pageHitLayer: HTMLElement;
   private readonly continuousHitLayer: HTMLElement;
+  private readonly pageLinkLayer: HTMLElement;
+  private readonly continuousLinkLayer: HTMLElement;
   private readonly pageAnnotationLayer: HTMLElement;
   private readonly continuousAnnotationLayer: HTMLElement;
   private readonly emptyState: HTMLElement;
@@ -137,6 +160,7 @@ export class ReaderApplication {
   private gridLayout?: GridLayout;
   private pageSizes: Size[] = [];
   private readonly thumbnailCanvases = new Map<number, HTMLCanvasElement>();
+  private readonly thumbnailLabels = new Map<number, HTMLElement>();
   private gridPreparation?: Promise<void>;
   private gridGeneration = 0;
   private gridSizesReady = false;
@@ -161,6 +185,7 @@ export class ReaderApplication {
   private pageTurnSettling = false;
   private pageTurnGeneration = 0;
   private opening = false;
+  private exporting = false;
   private viewGeneration = 0;
   private persistenceTimer?: number;
   private statusTimer?: number;
@@ -175,6 +200,8 @@ export class ReaderApplication {
   private searchHits: SearchHit[] = [];
   private activeSearchHit = -1;
   private hitOverlayGeneration = 0;
+  private linkOverlayGeneration = 0;
+  private readonly visiblePdfLinks = new Map<string, VisiblePdfLink>();
   private outlineNodes?: PdfOutlineNode[];
   private flatOutline: FlatOutlineItem[] = [];
   private panelScrollTouch?: { element: HTMLElement; lastY: number; lastAt: number; velocity: number };
@@ -191,6 +218,10 @@ export class ReaderApplication {
   private ink?: InkState;
   private liveInkSurface?: LiveInkSurface;
   private editingNoteId?: string;
+  private readonly pendingPdfImports: File[] = [];
+  private importsReady = false;
+  private importQueueRunning = false;
+  private importRetryTimer?: number;
 
   constructor(private readonly root: HTMLElement) {
     root.innerHTML = this.markup();
@@ -200,6 +231,8 @@ export class ReaderApplication {
     this.continuousLayer = required(root, "#continuous-pages");
     this.pageHitLayer = required(root, "#page-hit-layer");
     this.continuousHitLayer = required(root, "#continuous-hit-layer");
+    this.pageLinkLayer = required(root, "#page-link-layer");
+    this.continuousLinkLayer = required(root, "#continuous-link-layer");
     this.pageAnnotationLayer = required(root, "#page-annotation-layer");
     this.continuousAnnotationLayer = required(root, "#continuous-annotation-layer");
     this.emptyState = required(root, "#empty-state");
@@ -230,9 +263,21 @@ export class ReaderApplication {
   }
 
   async start(): Promise<void> {
+    const sharedTarget = this.takeSharedTargetRequest();
     this.installHistoryDefense();
+    this.installFileLaunchConsumer();
     void this.registerServiceWorker();
     await this.restoreSession();
+    if (sharedTarget.error) this.showStatus(sharedTarget.error, true);
+    if (sharedTarget.id) {
+      try {
+        this.pendingPdfImports.push(await this.readSharedTargetFile(sharedTarget.id));
+      } catch (error) {
+        this.showStatus(`Unable to receive shared PDF: ${errorMessage(error)}`, true);
+      }
+    }
+    this.importsReady = true;
+    this.drainPdfImports();
   }
 
   private markup(): string {
@@ -243,10 +288,12 @@ export class ReaderApplication {
             <canvas id="previous-page" class="pdf-page" aria-hidden="true" hidden></canvas>
             <canvas id="current-page" class="pdf-page" aria-label="Current PDF page" hidden></canvas>
             <canvas id="next-page" class="pdf-page" aria-hidden="true" hidden></canvas>
+            <div id="page-link-layer" class="link-layer" aria-label="PDF links"></div>
             <div id="page-annotation-layer" class="annotation-layer" aria-label="Page annotations"></div>
             <div id="page-hit-layer" class="hit-layer" aria-hidden="true"></div>
           </div>
           <div id="continuous-pages" class="continuous-pages" role="group" aria-label="Continuous PDF pages" hidden>
+            <div id="continuous-link-layer" class="link-layer" aria-label="Visible PDF links"></div>
             <div id="continuous-annotation-layer" class="annotation-layer" aria-label="Visible page annotations"></div>
             <div id="continuous-hit-layer" class="hit-layer" aria-hidden="true"></div>
           </div>
@@ -294,6 +341,7 @@ export class ReaderApplication {
               <button id="outline-open" type="button">Outline</button>
               <button id="recents-open" type="button">Recents</button>
               <button id="annotations-open" type="button">Annotations</button>
+              <button id="export-open" type="button">Export annotated copy</button>
             </div>
           </section>
           <section id="drawer-panel" class="reader-panel drawer-panel reader-control" data-reader-control role="dialog" aria-modal="false" aria-labelledby="drawer-title" hidden>
@@ -351,6 +399,8 @@ export class ReaderApplication {
     this.drawerContent.addEventListener("click", (event) => void this.onDrawerAction(event));
     this.pageAnnotationLayer.addEventListener("click", (event) => this.onAnnotationLayerAction(event));
     this.continuousAnnotationLayer.addEventListener("click", (event) => this.onAnnotationLayerAction(event));
+    this.pageLinkLayer.addEventListener("click", (event) => this.onPdfLinkAction(event));
+    this.continuousLinkLayer.addEventListener("click", (event) => this.onPdfLinkAction(event));
     required<HTMLButtonElement>(this.root, "#selection-copy").addEventListener("click", () => void this.copySelection());
     required<HTMLButtonElement>(this.root, "#selection-highlight").addEventListener("click", () => void this.createHighlight());
     required<HTMLButtonElement>(this.root, "#selection-note").addEventListener("click", () => this.openNoteEditor());
@@ -400,7 +450,7 @@ export class ReaderApplication {
         }, { passive: false });
       }
     }
-    this.fileInput.addEventListener("change", () => void this.importSelected());
+    this.fileInput.addEventListener("change", () => this.importSelected());
     this.scene.addEventListener("touchstart", (event) => this.onTouchStart(event), { passive: false });
     this.scene.addEventListener("touchmove", (event) => this.onTouchMove(event), { passive: false });
     this.scene.addEventListener("touchend", (event) => void this.onTouchEnd(event), { passive: false });
@@ -423,10 +473,38 @@ export class ReaderApplication {
     window.addEventListener("keydown", (event) => void this.onKeyDown(event));
   }
 
-  private async importSelected(): Promise<void> {
+  private importSelected(): void {
     const file = this.fileInput.files?.[0];
     this.fileInput.value = "";
-    if (!file || this.opening) return;
+    if (file) this.enqueuePdfImports([file]);
+  }
+
+  private enqueuePdfImports(files: readonly File[]): void {
+    this.pendingPdfImports.push(...files);
+    this.drainPdfImports();
+  }
+
+  private drainPdfImports(): void {
+    if (!this.importsReady || this.importQueueRunning || this.pendingPdfImports.length === 0) return;
+    if (this.opening) {
+      if (this.importRetryTimer === undefined) {
+        this.importRetryTimer = window.setTimeout(() => {
+          this.importRetryTimer = undefined;
+          this.drainPdfImports();
+        }, 100);
+      }
+      return;
+    }
+    const file = this.pendingPdfImports.shift();
+    if (!file) return;
+    this.importQueueRunning = true;
+    void this.importPdfFile(file).finally(() => {
+      this.importQueueRunning = false;
+      this.drainPdfImports();
+    });
+  }
+
+  private async importPdfFile(file: File): Promise<void> {
     this.opening = true;
     this.showStatus(`Importing ${file.name}…`);
     let storedId: string | undefined;
@@ -1559,7 +1637,7 @@ export class ReaderApplication {
         let canvas = this.spreadCanvases.get(pageNumber);
         if (!canvas) {
           canvas = documentElement("canvas", "pdf-page spread-page");
-          this.track.insertBefore(canvas, this.pageAnnotationLayer);
+          this.track.insertBefore(canvas, this.pageLinkLayer);
           this.spreadCanvases.set(pageNumber, canvas);
         }
         this.positionCanvas(canvas, layout, slot.slot * this.viewport().width);
@@ -1608,7 +1686,7 @@ export class ReaderApplication {
       let canvas = this.continuousCanvases.get(pageLayout.pageNumber);
       if (!canvas) {
         canvas = documentElement("canvas", "pdf-page continuous-page");
-        this.continuousLayer.insertBefore(canvas, this.continuousAnnotationLayer);
+        this.continuousLayer.insertBefore(canvas, this.continuousLinkLayer);
         this.continuousCanvases.set(pageLayout.pageNumber, canvas);
       }
       canvas.style.left = `${pageLayout.x}px`;
@@ -1680,6 +1758,10 @@ export class ReaderApplication {
     const continuousShown = this.viewMode === "reading" && this.layoutMode === "continuous";
     this.continuousLayer.hidden = !continuousShown;
     this.track.hidden = continuousShown;
+    this.pageLinkLayer.inert = this.viewMode !== "reading" || continuousShown;
+    this.continuousLinkLayer.inert = !continuousShown;
+    this.pageLinkLayer.setAttribute("aria-hidden", String(this.pageLinkLayer.inert));
+    this.continuousLinkLayer.setAttribute("aria-hidden", String(this.continuousLinkLayer.inert));
     this.scene.dataset.view = this.viewMode;
   }
 
@@ -1906,6 +1988,56 @@ export class ReaderApplication {
       this.openRecents();
     } else if (button?.id === "annotations-open") {
       this.openAnnotations();
+    } else if (button?.id === "export-open") {
+      await this.exportAnnotatedCopy();
+    }
+  }
+
+  private async exportAnnotatedCopy(): Promise<void> {
+    const sidecar = this.sidecar;
+    if (!this.document || !sidecar || this.exporting) return;
+    if (this.annotations.length === 0) {
+      this.showStatus("There are no annotations to export.", false, 2000);
+      return;
+    }
+    const annotations = [...this.annotations];
+    this.exporting = true;
+    this.closePanels();
+    this.showStatus("Preparing annotated copy…");
+    try {
+      const bytes = await readPdf(sidecar.id);
+      if (this.sidecar !== sidecar) return;
+      const result = await exportAnnotatedPdf(bytes, annotations, sidecar.name);
+      if (this.sidecar !== sidecar) return;
+      const fileBuffer = new ArrayBuffer(result.bytes.byteLength);
+      new Uint8Array(fileBuffer).set(result.bytes);
+      const blob = new Blob([fileBuffer], { type: "application/pdf" });
+      const file = new File([blob], result.fileName, { type: "application/pdf" });
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: result.fileName });
+        if (this.sidecar !== sidecar) return;
+      } else {
+        const url = URL.createObjectURL(file);
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = result.fileName;
+        document.body.append(anchor);
+        anchor.click();
+        anchor.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      }
+      const skipped = result.skipped > 0 ? ` ${result.skipped} annotation${result.skipped === 1 ? "" : "s"} could not be placed.` : "";
+      this.showStatus(`Exported ${result.fileName}.${skipped}`, false, 2600);
+    } catch (error) {
+      if (this.sidecar !== sidecar) return;
+      const name = error instanceof Error || error instanceof DOMException ? error.name : "";
+      if (name === "AbortError") {
+        this.hideStatus();
+        return;
+      }
+      this.showStatus(`Unable to export annotated copy: ${errorMessage(error)}`, true);
+    } finally {
+      this.exporting = false;
     }
   }
 
@@ -2048,6 +2180,7 @@ export class ReaderApplication {
     this.pageHitLayer.replaceChildren();
     this.continuousHitLayer.replaceChildren();
     this.refreshAnnotationOverlays();
+    void this.refreshLinkOverlays();
     if (!document || this.searchHits.length === 0) return;
     const targets: { pageNumber: number; layout: PageLayout; layer: HTMLElement }[] = [];
     if (this.layoutMode === "continuous" && this.continuousLayout) {
@@ -2084,6 +2217,89 @@ export class ReaderApplication {
         }
       }
     }
+  }
+
+  private async refreshLinkOverlays(): Promise<void> {
+    const document = this.document;
+    const generation = ++this.linkOverlayGeneration;
+    this.pageLinkLayer.replaceChildren();
+    this.continuousLinkLayer.replaceChildren();
+    this.visiblePdfLinks.clear();
+    if (!document || this.viewMode !== "reading") return;
+    const layer = this.layoutMode === "continuous" ? this.continuousLinkLayer : this.pageLinkLayer;
+    const targets = this.visibleOverlayTargets().map(({ pageNumber, layout }) => ({ pageNumber, layout, layer }));
+    const pages = await Promise.all(targets.map(async (target) => {
+      try {
+        return { target, links: await document.pageLinks(target.pageNumber) };
+      } catch (error) {
+        console.warn(`Links on page ${target.pageNumber} are unavailable`, error);
+        return { target, links: [] };
+      }
+    }));
+    if (generation !== this.linkOverlayGeneration || document !== this.document || this.viewMode !== "reading") return;
+    for (const { target, links } of pages) {
+      links.forEach((link, index) => this.renderPdfLink(link, target.pageNumber, index, target.layout, target.layer, generation));
+    }
+  }
+
+  private renderPdfLink(
+    link: PdfLink,
+    sourcePage: number,
+    index: number,
+    layout: PageLayout,
+    layer: HTMLElement,
+    generation: number
+  ): void {
+    const key = `${generation}:${sourcePage}:${index}`;
+    this.visiblePdfLinks.set(key, { link, sourcePage });
+    const button = documentElement("button", "pdf-link");
+    button.type = "button";
+    button.dataset.pdfLink = key;
+    button.style.left = `${layout.x + link.rect.x * layout.width}px`;
+    button.style.top = `${layout.y + link.rect.y * layout.height}px`;
+    button.style.width = `${Math.max(1, link.rect.width * layout.width)}px`;
+    button.style.height = `${Math.max(1, link.rect.height * layout.height)}px`;
+    if (link.target.kind === "url") {
+      button.setAttribute("aria-label", `Open external PDF link: ${externalLinkLabel(link.target.url)}`);
+      button.title = link.target.url;
+    } else if (link.target.kind === "action") {
+      button.setAttribute("aria-label", pageActionLabel(link.target.action));
+    } else {
+      button.setAttribute("aria-label", "Follow internal PDF link");
+    }
+    layer.append(button);
+  }
+
+  private onPdfLinkAction(event: Event): void {
+    const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>("button[data-pdf-link]") : null;
+    const visible = button?.dataset.pdfLink ? this.visiblePdfLinks.get(button.dataset.pdfLink) : undefined;
+    if (!visible) return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.clearPendingTap();
+    this.cancelTouches();
+    const { link } = visible;
+    if (link.target.kind === "url") {
+      if (window.confirm(`Open this external link?\n\n${link.target.url}`)) {
+        window.open(link.target.url, "_blank", "noopener,noreferrer");
+      }
+      return;
+    }
+    void this.followInternalPdfLink(visible);
+  }
+
+  private async followInternalPdfLink({ link, sourcePage }: VisiblePdfLink): Promise<void> {
+    const document = this.document;
+    if (!document) return;
+    const targetPage = link.target.kind === "destination"
+      ? await document.resolveDestination(link.target.destination)
+      : link.target.kind === "action" ? pageForPdfAction(link.target.action, sourcePage, document.pageCount) : undefined;
+    if (document !== this.document) return;
+    if (!targetPage) {
+      this.showStatus("This PDF link destination is unavailable.", true, 2200);
+      return;
+    }
+    await this.goToPage(targetPage);
   }
 
   private clearSearch(): void {
@@ -2817,6 +3033,10 @@ export class ReaderApplication {
     this.continuousSyncedScroll = Number.NaN;
     this.continuousHitLayer.replaceChildren();
     this.pageHitLayer.replaceChildren();
+    this.linkOverlayGeneration += 1;
+    this.visiblePdfLinks.clear();
+    this.continuousLinkLayer.replaceChildren();
+    this.pageLinkLayer.replaceChildren();
     this.continuousAnnotationLayer.replaceChildren();
     this.pageAnnotationLayer.replaceChildren();
     if (!preserveSingle) {
@@ -2877,6 +3097,56 @@ export class ReaderApplication {
     history.replaceState({ mreader: "root" }, "");
     history.pushState({ mreader: "guard" }, "");
     window.addEventListener("popstate", () => history.pushState({ mreader: "guard" }, ""));
+  }
+
+  private installFileLaunchConsumer(): void {
+    const launchQueue = (window as Window & { launchQueue?: FileLaunchQueue }).launchQueue;
+    const launchParams = (globalThis as typeof globalThis & { LaunchParams?: { prototype: object } }).LaunchParams;
+    if (!launchQueue || !launchParams || !("files" in launchParams.prototype)) return;
+    launchQueue.setConsumer((params) => {
+      void this.receiveLaunchedFiles(params.files ?? []);
+    });
+  }
+
+  private async receiveLaunchedFiles(handles: readonly FileSystemFileHandle[]): Promise<void> {
+    for (const handle of handles) {
+      try {
+        this.enqueuePdfImports([await handle.getFile()]);
+      } catch (error) {
+        this.showStatus(`Unable to open launched PDF: ${errorMessage(error)}`, true);
+      }
+    }
+  }
+
+  private takeSharedTargetRequest(): SharedTargetRequest {
+    const url = new URL(window.location.href);
+    const id = url.searchParams.get("mreader-share") ?? undefined;
+    const shareError = url.searchParams.get("mreader-share-error");
+    if (!id && !shareError) return {};
+    url.searchParams.delete("mreader-share");
+    url.searchParams.delete("mreader-share-error");
+    history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
+    return {
+      id,
+      error: shareError ? "Only non-empty PDF files can be shared to mreader." : undefined
+    };
+  }
+
+  private async readSharedTargetFile(id: string): Promise<File> {
+    if (!/^[a-zA-Z0-9_-]{8,128}$/.test(id)) throw new Error("The shared file identifier is invalid.");
+    const response = await fetch(new URL(`./__mreader_shared_pdf__/${encodeURIComponent(id)}`, document.baseURI));
+    if (!response.ok) throw new Error("The shared file is no longer available.");
+    const encodedName = response.headers.get("X-Mreader-Filename");
+    let name = "shared.pdf";
+    if (encodedName) {
+      try {
+        name = decodeURIComponent(encodedName);
+      } catch {
+        name = "shared.pdf";
+      }
+    }
+    if (!name.toLowerCase().endsWith(".pdf")) name += ".pdf";
+    return new File([await response.blob()], name, { type: "application/pdf", lastModified: Date.now() });
   }
 
   private async registerServiceWorker(): Promise<void> {
@@ -3083,12 +3353,16 @@ export class ReaderApplication {
     const grid = this.gridLayout;
     if (!document || !grid) return;
     this.gridSyncedOffset = this.gridOffset;
-    const pages = visibleGridPages(grid, this.gridOffset, this.viewport(), 1);
+    const viewport = this.viewport();
+    const pages = visibleGridPages(grid, this.gridOffset, viewport, 2);
+    const fullResolutionPages = new Set(visibleGridPages(grid, this.gridOffset, viewport, 0).map((page) => page.pageNumber));
     const visible = new Set(pages.map((page) => page.pageNumber));
     for (const [pageNumber, canvas] of this.thumbnailCanvases) {
       if (visible.has(pageNumber)) continue;
       canvas.remove();
+      this.thumbnailLabels.get(pageNumber)?.remove();
       this.thumbnailCanvases.delete(pageNumber);
+      this.thumbnailLabels.delete(pageNumber);
     }
     const specs: ThumbnailRenderSpec[] = [];
     for (const page of pages) {
@@ -3099,20 +3373,36 @@ export class ReaderApplication {
         canvas.setAttribute("aria-label", `Page ${page.pageNumber}`);
         this.gridLayer.append(canvas);
         this.thumbnailCanvases.set(page.pageNumber, canvas);
+        const label = documentElement("span", "thumbnail-page-number");
+        label.textContent = String(page.pageNumber);
+        label.setAttribute("aria-hidden", "true");
+        this.gridLayer.append(label);
+        this.thumbnailLabels.set(page.pageNumber, label);
       }
       canvas.style.left = `${page.x}px`;
       canvas.style.top = `${page.y}px`;
       canvas.style.width = `${page.width}px`;
       canvas.style.height = `${page.height}px`;
       canvas.classList.toggle("focused", page.pageNumber === this.gridFocusPage);
-      const rowDistance = Math.abs(page.pageNumber - this.gridFocusPage);
+      const label = this.thumbnailLabels.get(page.pageNumber);
+      if (label) {
+        label.style.left = `${page.x}px`;
+        label.style.top = `${page.y + page.height + 4}px`;
+        label.style.width = `${page.width}px`;
+      }
+      const screenLeft = page.x + this.gridOffset;
+      const screenRight = screenLeft + page.width;
+      const viewportDistance = screenRight < 0
+        ? -screenRight
+        : screenLeft > viewport.width ? screenLeft - viewport.width : 0;
+      const fullResolution = fullResolutionPages.has(page.pageNumber);
       specs.push({
         pageNumber: page.pageNumber,
         canvas,
         cssWidth: page.width,
         cssHeight: page.height,
-        dpr: Math.min(Math.max(window.devicePixelRatio, 1), 2),
-        priority: rowDistance
+        dpr: fullResolution ? Math.min(Math.max(window.devicePixelRatio, 1), 2) : 0.6,
+        priority: (fullResolution ? 0 : viewport.width) + viewportDistance
       });
     }
     void this.thumbnailRenderer.settle(document, specs);
@@ -3120,7 +3410,9 @@ export class ReaderApplication {
 
   private clearThumbnailElements(): void {
     for (const canvas of this.thumbnailCanvases.values()) canvas.remove();
+    for (const label of this.thumbnailLabels.values()) label.remove();
     this.thumbnailCanvases.clear();
+    this.thumbnailLabels.clear();
     this.gridSyncedOffset = Number.NaN;
   }
 
@@ -3323,4 +3615,19 @@ function nextFrame(): Promise<void> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function pageActionLabel(action: PdfLinkAction): string {
+  if (action === "FirstPage") return "Go to first PDF page";
+  if (action === "LastPage") return "Go to last PDF page";
+  return action === "NextPage" ? "Go to next PDF page" : "Go to previous PDF page";
+}
+
+function externalLinkLabel(url: string): string {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname || parsed.protocol.slice(0, -1);
+  } catch {
+    return "external destination";
+  }
 }

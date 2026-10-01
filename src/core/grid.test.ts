@@ -51,6 +51,10 @@ describe("thumbnail grid geometry", () => {
     expect(visible.length).toBeGreaterThan(0);
     expect(visible.length).toBeLessThan(40);
     expect(visible.every((page) => page.x - 5000 + page.width >= -600 && page.x - 5000 <= 1200)).toBe(true);
+    const extended = visibleGridPages(grid, -5000, viewport, 2);
+    expect(extended.length).toBeGreaterThan(visible.length);
+    expect(extended.length).toBeLessThan(64);
+    expect(extended.every((page) => page.x - 5000 + page.width >= -1200 && page.x - 5000 <= 1800)).toBe(true);
   });
 
   it("refreshes a virtual window only after a bounded drag distance", () => {

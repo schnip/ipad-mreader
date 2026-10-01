@@ -69,9 +69,9 @@ Deferred center-tap bars with double-tap disambiguation, explicit ordered open-d
 
 P5 does not include document deletion/library management, save/export, or print. P4 deliberately provides no annotation, ink, text-selection, save, export, or print UI.
 
-### P6 — export and print
+### P6 — export, print, and embedded PDF links
 
-Burn sidecar highlights, notes, and ink into a new PDF and send it through `navigator.share`; retain original bytes unchanged. Add browser printing.
+Burn sidecar highlights, notes, and ink into a new PDF and send it through `navigator.share`; retain original bytes unchanged. Add browser printing. Render accessible, camera-aligned PDF link annotations in every reading layout: internal destinations navigate in-app, named page actions are bounded, and safe external URLs require explicit confirmation before opening. Link controls must not leak into reader gestures and are inactive in the thumbnail grid.
 
 ### P7 — polish
 

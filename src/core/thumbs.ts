@@ -36,11 +36,16 @@ export class StaleGeneration {
 }
 
 export function thumbnailCacheKey(documentId: string, spec: Pick<ThumbnailRenderSpec, "pageNumber" | "cssWidth" | "cssHeight" | "dpr">): string {
-  return `${documentId}:${spec.pageNumber}:${Math.round(spec.cssWidth * spec.dpr)}x${Math.round(spec.cssHeight * spec.dpr)}`;
+  const dpr = thumbnailRasterDpr(spec.dpr);
+  return `${documentId}:${spec.pageNumber}:${Math.round(spec.cssWidth * dpr)}x${Math.round(spec.cssHeight * dpr)}`;
 }
 
 export function orderThumbnailSpecs(specs: readonly ThumbnailRenderSpec[]): ThumbnailRenderSpec[] {
   return [...specs].sort((a, b) => a.priority - b.priority || a.pageNumber - b.pageNumber);
+}
+
+export function thumbnailRasterDpr(dpr: number): number {
+  return Math.min(Math.max(0.5, Number.isFinite(dpr) ? dpr : 1), 1.5);
 }
 
 export class ThumbnailRenderer {
@@ -49,7 +54,7 @@ export class ThumbnailRenderer {
   private activeJob?: PdfRenderJob;
   private processor?: ThumbnailWorkerProcessor;
 
-  constructor(maximumEntries = 64, maximumBytes = 32 * 1024 * 1024) {
+  constructor(maximumEntries = 128, maximumBytes = 32 * 1024 * 1024) {
     this.cache = new WeightedLruCache(maximumEntries, maximumBytes, (surface) => surface.close?.());
     this.processor = ThumbnailWorkerProcessor.create();
   }
@@ -92,7 +97,7 @@ export class ThumbnailRenderer {
     }
     const page = await pdf.page(spec.pageNumber);
     if (!this.generations.isCurrent(generation)) return;
-    const dpr = Math.min(Math.max(1, spec.dpr), 1.5);
+    const dpr = thumbnailRasterDpr(spec.dpr);
     const canvas = document.createElement("canvas");
     const scale = Math.min(spec.cssWidth / page.size.width, spec.cssHeight / page.size.height);
     const job = page.render(canvas, scale, dpr);

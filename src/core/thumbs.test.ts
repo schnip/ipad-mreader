@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { StaleGeneration, orderThumbnailSpecs, thumbnailCacheKey } from "./thumbs";
+import { StaleGeneration, orderThumbnailSpecs, thumbnailCacheKey, thumbnailRasterDpr } from "./thumbs";
 import type { ThumbnailRenderSpec } from "./thumbs";
 
 const canvas = {} as HTMLCanvasElement;
@@ -19,6 +19,13 @@ describe("thumbnail scheduling helpers", () => {
 
   it("keys cache entries by document, page, and raster dimensions", () => {
     expect(thumbnailCacheKey("book", spec(4, 0))).toBe("book:4:180x270");
+    expect(thumbnailCacheKey("book", { ...spec(4, 0), dpr: 2 })).toBe("book:4:180x270");
+  });
+
+  it("allows bounded low-resolution prefetch rasters", () => {
+    expect(thumbnailRasterDpr(0.6)).toBe(0.6);
+    expect(thumbnailRasterDpr(0.1)).toBe(0.5);
+    expect(thumbnailRasterDpr(Number.NaN)).toBe(1);
   });
 
   it("invalidates stale generations on every new schedule", () => {
