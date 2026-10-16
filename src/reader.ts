@@ -31,6 +31,7 @@ import type { DocumentSidecar, FitState, ReadingPosition } from "./store/sidecar
 import { addOpenDocument, closeOpenDocument, emptyOpenSession, loadOpenSession, normalizeOpenSession, saveOpenSession, selectOpenDocument } from "./store/session";
 import type { OpenDocumentSession } from "./store/session";
 import { deleteAnnotation, listDocumentAnnotations, putAnnotation } from "./store/annotations";
+import { platform } from "./platform";
 
 interface SingleTouch {
   startedAt: number;
@@ -87,19 +88,6 @@ interface LiveInkSurface {
   ink: InkState;
   layout: PageLayout;
   renderedPointCount: number;
-}
-
-interface FileLaunchParams {
-  files?: readonly FileSystemFileHandle[];
-}
-
-interface FileLaunchQueue {
-  setConsumer(consumer: (params: FileLaunchParams) => void): void;
-}
-
-interface SharedTargetRequest {
-  id?: string;
-  error?: string;
 }
 
 interface VisiblePdfLink {
@@ -263,19 +251,16 @@ export class ReaderApplication {
   }
 
   async start(): Promise<void> {
-    const sharedTarget = this.takeSharedTargetRequest();
-    this.installHistoryDefense();
-    this.installFileLaunchConsumer();
-    void this.registerServiceWorker();
+    // Ingress first: the web share-target handoff must read and strip its URL
+    // parameters before the back handler's history defense rewrites state.
+    const deliverStartupIngress = platform.installIngress(
+      (files) => this.enqueuePdfImports(files),
+      (message) => this.showStatus(message, true)
+    );
+    platform.installBackHandler(() => this.dismissForemost());
+    void platform.registerServiceWorker();
     await this.restoreSession();
-    if (sharedTarget.error) this.showStatus(sharedTarget.error, true);
-    if (sharedTarget.id) {
-      try {
-        this.pendingPdfImports.push(await this.readSharedTargetFile(sharedTarget.id));
-      } catch (error) {
-        this.showStatus(`Unable to receive shared PDF: ${errorMessage(error)}`, true);
-      }
-    }
+    await deliverStartupIngress();
     this.importsReady = true;
     this.drainPdfImports();
   }
@@ -1897,6 +1882,22 @@ export class ReaderApplication {
     if (this.viewMode === "grid") this.syncGridThumbnails();
   }
 
+  /**
+   * Dismisses the foremost dismissible UI, mirroring Escape. Returns whether
+   * anything was dismissed. Full back-button ordering is PLAN_APK.md A3.
+   */
+  private dismissForemost(): boolean {
+    if (!this.findPanel.hidden || !this.morePanel.hidden || !this.drawerPanel.hidden || !this.annotationEditor.hidden) {
+      this.closePanels();
+      return true;
+    }
+    if (this.chromeVisible) {
+      this.setChromeVisible(false);
+      return true;
+    }
+    return false;
+  }
+
   private async onKeyDown(event: KeyboardEvent): Promise<void> {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
       event.preventDefault();
@@ -1904,13 +1905,7 @@ export class ReaderApplication {
       return;
     }
     if (event.key === "Escape") {
-      if (!this.findPanel.hidden || !this.morePanel.hidden || !this.drawerPanel.hidden || !this.annotationEditor.hidden) {
-        event.preventDefault();
-        this.closePanels();
-      } else if (this.chromeVisible) {
-        event.preventDefault();
-        this.setChromeVisible(false);
-      }
+      if (this.dismissForemost()) event.preventDefault();
       return;
     }
     const typing = isTypingTarget(event.target) || isTypingTarget(document.activeElement);
@@ -2013,19 +2008,8 @@ export class ReaderApplication {
       new Uint8Array(fileBuffer).set(result.bytes);
       const blob = new Blob([fileBuffer], { type: "application/pdf" });
       const file = new File([blob], result.fileName, { type: "application/pdf" });
-      if (navigator.canShare?.({ files: [file] })) {
-        await navigator.share({ files: [file], title: result.fileName });
-        if (this.sidecar !== sidecar) return;
-      } else {
-        const url = URL.createObjectURL(file);
-        const anchor = document.createElement("a");
-        anchor.href = url;
-        anchor.download = result.fileName;
-        document.body.append(anchor);
-        anchor.click();
-        anchor.remove();
-        window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
-      }
+      await platform.deliverExport(file);
+      if (this.sidecar !== sidecar) return;
       const skipped = result.skipped > 0 ? ` ${result.skipped} annotation${result.skipped === 1 ? "" : "s"} could not be placed.` : "";
       this.showStatus(`Exported ${result.fileName}.${skipped}`, false, 2600);
     } catch (error) {
@@ -2281,7 +2265,7 @@ export class ReaderApplication {
     const { link } = visible;
     if (link.target.kind === "url") {
       if (window.confirm(`Open this external link?\n\n${link.target.url}`)) {
-        window.open(link.target.url, "_blank", "noopener,noreferrer");
+        platform.openExternalUrl(link.target.url);
       }
       return;
     }
@@ -3091,71 +3075,6 @@ export class ReaderApplication {
   private hideStatus(): void {
     this.status.hidden = true;
     this.status.textContent = "";
-  }
-
-  private installHistoryDefense(): void {
-    history.replaceState({ mreader: "root" }, "");
-    history.pushState({ mreader: "guard" }, "");
-    window.addEventListener("popstate", () => history.pushState({ mreader: "guard" }, ""));
-  }
-
-  private installFileLaunchConsumer(): void {
-    const launchQueue = (window as Window & { launchQueue?: FileLaunchQueue }).launchQueue;
-    const launchParams = (globalThis as typeof globalThis & { LaunchParams?: { prototype: object } }).LaunchParams;
-    if (!launchQueue || !launchParams || !("files" in launchParams.prototype)) return;
-    launchQueue.setConsumer((params) => {
-      void this.receiveLaunchedFiles(params.files ?? []);
-    });
-  }
-
-  private async receiveLaunchedFiles(handles: readonly FileSystemFileHandle[]): Promise<void> {
-    for (const handle of handles) {
-      try {
-        this.enqueuePdfImports([await handle.getFile()]);
-      } catch (error) {
-        this.showStatus(`Unable to open launched PDF: ${errorMessage(error)}`, true);
-      }
-    }
-  }
-
-  private takeSharedTargetRequest(): SharedTargetRequest {
-    const url = new URL(window.location.href);
-    const id = url.searchParams.get("mreader-share") ?? undefined;
-    const shareError = url.searchParams.get("mreader-share-error");
-    if (!id && !shareError) return {};
-    url.searchParams.delete("mreader-share");
-    url.searchParams.delete("mreader-share-error");
-    history.replaceState(history.state, "", `${url.pathname}${url.search}${url.hash}`);
-    return {
-      id,
-      error: shareError ? "Only non-empty PDF files can be shared to mreader." : undefined
-    };
-  }
-
-  private async readSharedTargetFile(id: string): Promise<File> {
-    if (!/^[a-zA-Z0-9_-]{8,128}$/.test(id)) throw new Error("The shared file identifier is invalid.");
-    const response = await fetch(new URL(`./__mreader_shared_pdf__/${encodeURIComponent(id)}`, document.baseURI));
-    if (!response.ok) throw new Error("The shared file is no longer available.");
-    const encodedName = response.headers.get("X-Mreader-Filename");
-    let name = "shared.pdf";
-    if (encodedName) {
-      try {
-        name = decodeURIComponent(encodedName);
-      } catch {
-        name = "shared.pdf";
-      }
-    }
-    if (!name.toLowerCase().endsWith(".pdf")) name += ".pdf";
-    return new File([await response.blob()], name, { type: "application/pdf", lastModified: Date.now() });
-  }
-
-  private async registerServiceWorker(): Promise<void> {
-    if (!("serviceWorker" in navigator) || !window.isSecureContext) return;
-    try {
-      await navigator.serviceWorker.register("./sw.js", { scope: "./" });
-    } catch (error) {
-      console.warn("Service worker registration failed", error);
-    }
   }
 
   private ensureGridLayout(): void {
