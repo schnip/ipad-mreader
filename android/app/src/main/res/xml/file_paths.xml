@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- Only the app-private cache directory is shareable. Exported annotated
+     copies and incoming temporary PDFs live there (PLAN_APK.md A2/A3);
+     external storage is never exposed through the FileProvider. -->
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
-    <external-path name="my_images" path="." />
-    <cache-path name="my_cache_images" path="." />
+    <cache-path name="cache" path="." />
 </paths>

@@ -1,13 +1,24 @@
+import { isRecord } from "../core/math";
+import { withStore } from "./idb";
+import type { DatabaseSpec } from "./idb";
+
 export interface OpenDocumentSession {
   version: 1;
   documentIds: string[];
   currentId?: string;
 }
 
-const DATABASE_NAME = "mreader-session";
-const DATABASE_VERSION = 1;
 const SESSION_STORE = "state";
 const SESSION_KEY = "open-documents";
+
+const SESSION_DATABASE: DatabaseSpec = {
+  name: "mreader-session",
+  version: 1,
+  label: "document session",
+  upgrade(database) {
+    if (!database.objectStoreNames.contains(SESSION_STORE)) database.createObjectStore(SESSION_STORE);
+  }
+};
 
 export function emptyOpenSession(): OpenDocumentSession {
   return { version: 1, documentIds: [] };
@@ -53,59 +64,12 @@ export function closeOpenDocument(session: OpenDocumentSession, id: string): Ope
 }
 
 export async function loadOpenSession(): Promise<OpenDocumentSession | undefined> {
-  const database = await openDatabase();
-  try {
-    const transaction = database.transaction(SESSION_STORE, "readonly");
-    const complete = transactionComplete(transaction);
-    const value = await requestResult(transaction.objectStore(SESSION_STORE).get(SESSION_KEY));
-    await complete;
-    return value === undefined ? undefined : normalizeOpenSession(value);
-  } finally {
-    database.close();
-  }
+  const value: unknown = await withStore(SESSION_DATABASE, SESSION_STORE, "readonly", (store) => store.get(SESSION_KEY));
+  return value === undefined ? undefined : normalizeOpenSession(value);
 }
 
 export async function saveOpenSession(session: OpenDocumentSession): Promise<void> {
-  const database = await openDatabase();
-  try {
-    const transaction = database.transaction(SESSION_STORE, "readwrite");
-    const complete = transactionComplete(transaction);
-    const request = transaction.objectStore(SESSION_STORE).put(normalizeOpenSession(session), SESSION_KEY);
-    await requestResult(request);
-    await complete;
-  } finally {
-    database.close();
-  }
+  const normalized = normalizeOpenSession(session);
+  await withStore(SESSION_DATABASE, SESSION_STORE, "readwrite", (store) => store.put(normalized, SESSION_KEY));
 }
 
-function openDatabase(): Promise<IDBDatabase> {
-  if (!("indexedDB" in globalThis)) return Promise.reject(new Error("IndexedDB is unavailable in this browser."));
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
-    request.onerror = () => reject(request.error ?? new Error("Unable to open the document session database."));
-    request.onblocked = () => reject(new Error("The document session database is blocked by another app window."));
-    request.onupgradeneeded = () => {
-      if (!request.result.objectStoreNames.contains(SESSION_STORE)) request.result.createObjectStore(SESSION_STORE);
-    };
-    request.onsuccess = () => resolve(request.result);
-  });
-}
-
-function requestResult<T>(request: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed."));
-  });
-}
-
-function transactionComplete(transaction: IDBTransaction): Promise<void> {
-  return new Promise((resolve, reject) => {
-    transaction.oncomplete = () => resolve();
-    transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB transaction was aborted."));
-    transaction.onerror = () => reject(transaction.error ?? new Error("IndexedDB transaction failed."));
-  });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}

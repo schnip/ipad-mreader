@@ -140,6 +140,15 @@ describe("web platform", () => {
       expect(share).not.toHaveBeenCalled();
       expect(harness.anchors).toHaveLength(1);
     });
+
+    it("falls back to download when share activation has expired", async () => {
+      const notAllowed = new DOMException("activation expired", "NotAllowedError");
+      vi.stubGlobal("navigator", { canShare: () => true, share: vi.fn().mockRejectedValue(notAllowed) });
+      vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:export");
+      await platform.deliverExport(pdf());
+      expect(harness.anchors).toHaveLength(1);
+      expect(harness.anchors[0]?.click).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("opens external URLs in a separate, unlinked browsing context", () => {

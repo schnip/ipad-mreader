@@ -7,7 +7,8 @@ android {
         applicationId "org.schnip.mreader"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
+        // Pass -PmreaderVersionCode=N so a sideloaded update installs over an older APK.
+        versionCode((project.findProperty("mreaderVersionCode") ?: "1").toString().toInteger())
         versionName "1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {

@@ -1,4 +1,6 @@
 import type { SearchPageText, SearchTextItem } from "./search";
+import { textItemSeparator } from "./search";
+import { clamp, finite, isRecord } from "./math";
 
 export type Annotation = HighlightAnnotation | NoteAnnotation | InkAnnotation;
 export type AnnotationKind = Annotation["kind"];
@@ -150,6 +152,12 @@ export function normalizeAnnotation(value: unknown): Annotation | undefined {
   return undefined;
 }
 
+/** `normalizeAnnotation` narrowed to notes: anything else is rejected. */
+export function normalizeNote(value: unknown): NoteAnnotation | undefined {
+  const annotation = normalizeAnnotation(value);
+  return annotation?.kind === "note" ? annotation : undefined;
+}
+
 export function orderAnnotations(annotations: readonly Annotation[]): Annotation[] {
   return annotations.map((annotation, index) => ({ annotation, index })).sort((a, b) => (
     a.annotation.pageNumber - b.annotation.pageNumber
@@ -194,10 +202,15 @@ export function selectionRangeGeometry(page: SearchPageText, first: TextPosition
   let selectionStart = 0;
   let selectionEnd = 0;
   let cursor = 0;
+  let previousItem: SearchTextItem | undefined;
   page.items.forEach((item, itemIndex) => {
-    if (allText.length > 0) {
-      allText.push(" ");
-      cursor += 1;
+    // Items are joined like search joins them, so a word split across items
+    // (kerning, font changes) is not copied with a space inside it.
+    const separator = previousItem ? textItemSeparator(previousItem, item).separator : "";
+    previousItem = item;
+    if (separator) {
+      allText.push(separator);
+      cursor += separator.length;
     }
     const itemStart = cursor;
     allText.push(item.text);
@@ -206,6 +219,7 @@ export function selectionRangeGeometry(page: SearchPageText, first: TextPosition
     const to = itemIndex === range.end.itemIndex ? range.end.offset : itemIndex < range.end.itemIndex ? item.text.length : 0;
     if (itemIndex < range.start.itemIndex || itemIndex > range.end.itemIndex || to <= from || item.text.length === 0) return;
     if (selected.length === 0) selectionStart = itemStart + from;
+    else selected.push(separator);
     selectionEnd = itemStart + to;
     selected.push(item.text.slice(from, to));
     const startFraction = from / item.text.length;
@@ -231,7 +245,7 @@ export function selectionRangeGeometry(page: SearchPageText, first: TextPosition
     rects: validRects,
     startHandle: { x: firstRect.x, y: firstRect.y, height: firstRect.height },
     endHandle: { x: lastRect.x + lastRect.width, y: lastRect.y, height: lastRect.height },
-    text: selected.join(" "),
+    text: selected.join(""),
     context: `${contextFrom > 0 ? "…" : ""}${complete.slice(contextFrom, contextTo).trim()}${contextTo < complete.length ? "…" : ""}`
   };
 }
@@ -367,16 +381,4 @@ function normalizeColor(value: unknown, fallback: string): string {
 
 function boundedText(value: unknown, maximum: number): string {
   return typeof value === "string" ? value.slice(0, maximum) : "";
-}
-
-function finite(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(maximum, Math.max(minimum, value));
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }

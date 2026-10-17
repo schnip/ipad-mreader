@@ -1,7 +1,8 @@
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, degrees } from "pdf-lib";
 import { describe, expect, it } from "vitest";
 import type { Annotation } from "./annotations";
-import { annotatedFileName, exportAnnotatedPdf, inkThickness, parseHexColor, winAnsiSafe, wrapTextLines } from "./export";
+import { annotatedFileName, exportAnnotatedPdf, inkThickness, noteMarkerPlacement, parseHexColor, rotateVector, winAnsiSafe, wrapTextLines } from "./export";
+import { viewportMatrix, viewportSize } from "./export-geometry";
 
 describe("annotated PDF export helpers", () => {
   it("parses exact six-digit hex colors", () => {
@@ -90,5 +91,50 @@ describe("annotated PDF export", () => {
     const result = await exportAnnotatedPdf(input, [annotation], "Report.pdf");
     expect(result.skipped).toBe(1);
     expect((await PDFDocument.load(result.bytes)).getPageCount()).toBe(1);
+  });
+
+  it("exports onto rotated pages with an offset crop box", async () => {
+    const source = await PDFDocument.create();
+    for (const angle of [0, 90, 180, 270]) {
+      const page = source.addPage([612, 792]);
+      page.setRotation(degrees(angle));
+      page.setCropBox(20, 30, 500, 700);
+    }
+    const input = await source.save();
+    const annotations: Annotation[] = [1, 2, 3, 4].map((pageNumber) => ({
+      kind: "note", id: `note-${pageNumber}`, documentId: "document", pageNumber, createdAt: pageNumber, updatedAt: pageNumber,
+      color: "#ffb347", rects: [{ x: 0.2, y: 0.2, width: 0.3, height: 0.05 }], text: "selected", context: "", body: `Note ${pageNumber}`
+    }));
+    const result = await exportAnnotatedPdf(input, annotations, "Rotated.pdf");
+    expect(result.skipped).toBe(0);
+    expect(result.noteCount).toBe(4);
+    const output = await PDFDocument.load(result.bytes);
+    expect(output.getPageCount()).toBe(5);
+    expect(output.getPages().slice(0, 4).map((page) => page.getRotation().angle)).toEqual([0, 90, 180, 270]);
+  });
+});
+
+describe("note marker placement", () => {
+  const box = { x1: 0, y1: 0, x2: 600, y2: 800 };
+  const rect = { x: 0.1, y: 0.2, width: 0.3, height: 0.05 };
+
+  it("uses the displayed top-right corner of the last rectangle", () => {
+    expect(noteMarkerPlacement(box, 0, rect)).toEqual({ center: { x: 240, y: 640 }, textRotation: 0 });
+    for (const rotation of [90, 180, 270]) {
+      const placement = noteMarkerPlacement(box, rotation, rect);
+      if (!placement) throw new Error("Expected a marker placement.");
+      const [a, b, c, d, e, f] = viewportMatrix(box, rotation);
+      const size = viewportSize(box, rotation);
+      const view = { x: a * placement.center.x + c * placement.center.y + e, y: b * placement.center.x + d * placement.center.y + f };
+      expect(view.x / size.width).toBeCloseTo(0.4);
+      expect(view.y / size.height).toBeCloseTo(0.2);
+      expect(placement.textRotation).toBe(rotation);
+    }
+  });
+
+  it("rotates text offsets counter-clockwise", () => {
+    expect(rotateVector({ x: 1, y: 0 }, 90)).toEqual({ x: 0, y: 1 });
+    expect(rotateVector({ x: 1, y: 2 }, 180)).toEqual({ x: -1, y: -2 });
+    expect(rotateVector({ x: 1, y: 0 }, 270)).toEqual({ x: 0, y: -1 });
   });
 });

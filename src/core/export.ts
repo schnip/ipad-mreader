@@ -1,7 +1,8 @@
 import type { PDFFont, PDFPage } from "pdf-lib";
 import { annotationsForPage, inkSegments, orderAnnotations } from "./annotations";
-import type { Annotation, NoteAnnotation } from "./annotations";
-import { userPointFromNormalized, userRectFromNormalized, viewportSize } from "./export-geometry";
+import type { Annotation, NormalizedRect, NoteAnnotation } from "./annotations";
+import { normalizeRotation, userPointFromNormalized, userRectFromNormalized, viewportSize } from "./export-geometry";
+import type { UserPoint, ViewBox } from "./export-geometry";
 
 /**
  * Ink `baseWidth` was authored in CSS pixels against the iPad Air 5 portrait
@@ -95,8 +96,34 @@ export function annotatedFileName(name: string): string {
   return /\.pdf$/iu.test(leaf) ? `${leaf.slice(0, -4)} annotated.pdf` : `${leaf} annotated.pdf`;
 }
 
+export interface NoteMarkerPlacement {
+  /** Marker centre in PDF user space. */
+  center: UserPoint;
+  /** Counter-clockwise text rotation in degrees so the number reads upright. */
+  textRotation: number;
+}
+
+/**
+ * A note's numbered marker sits at the visual top-right corner of its last
+ * rectangle, as the page is displayed. Pages with /Rotate are displayed
+ * rotated clockwise, so the corner is chosen in normalized view space and the
+ * number is counter-rotated by the same angle.
+ */
+export function noteMarkerPlacement(box: ViewBox, rotation: number, lastRect: NormalizedRect): NoteMarkerPlacement | undefined {
+  const center = userPointFromNormalized(box, rotation, { x: lastRect.x + lastRect.width, y: lastRect.y });
+  return center ? { center, textRotation: normalizeRotation(rotation) } : undefined;
+}
+
+/** Rotates a vector counter-clockwise by `degreesCcw`. */
+export function rotateVector(vector: UserPoint, degreesCcw: number): UserPoint {
+  const radians = degreesCcw * Math.PI / 180;
+  const cos = Math.round(Math.cos(radians) * 1e12) / 1e12;
+  const sin = Math.round(Math.sin(radians) * 1e12) / 1e12;
+  return { x: vector.x * cos - vector.y * sin, y: vector.x * sin + vector.y * cos };
+}
+
 export async function exportAnnotatedPdf(bytes: Uint8Array, annotations: readonly Annotation[], documentName: string): Promise<ExportedPdf> {
-  const { PDFDocument, StandardFonts, LineCapStyle, rgb } = await import("pdf-lib");
+  const { BlendMode, PDFDocument, StandardFonts, LineCapStyle, degrees, rgb } = await import("pdf-lib");
   let pdf;
   try {
     pdf = await PDFDocument.load(bytes);
@@ -129,27 +156,33 @@ export async function exportAnnotatedPdf(bytes: Uint8Array, annotations: readonl
       const color = rgb(parsedColor?.r ?? 0, parsedColor?.g ?? 0, parsedColor?.b ?? 0);
       let placed = false;
       if (annotation.kind === "highlight" || annotation.kind === "note") {
-        let lastRect: ReturnType<typeof userRectFromNormalized>;
+        let lastRect: NormalizedRect | undefined;
         for (const rect of annotation.rects) {
           const mapped = userRectFromNormalized(viewBox, rotation, rect);
           if (!mapped || mapped.width <= 0 || mapped.height <= 0) continue;
-          page.drawRectangle({ ...mapped, color, opacity: annotation.kind === "highlight" ? 0.38 : 0.3 });
-          lastRect = mapped;
+          // Multiply matches the in-app tint over white paper but keeps the
+          // underlying text dark instead of washing it toward the highlight colour.
+          page.drawRectangle({ ...mapped, color, opacity: annotation.kind === "highlight" ? 0.38 : 0.3, blendMode: BlendMode.Multiply });
+          lastRect = rect;
           placed = true;
         }
         const noteNumber = annotation.kind === "note" ? noteNumbers.get(annotation) : undefined;
-        if (annotation.kind === "note" && noteNumber !== undefined && lastRect) {
+        const placement = lastRect ? noteMarkerPlacement(viewBox, rotation, lastRect) : undefined;
+        if (annotation.kind === "note" && noteNumber !== undefined && placement) {
           const marker = winAnsiSafe(String(noteNumber));
           const markerSize = 8;
-          const markerX = lastRect.x + lastRect.width;
-          const markerY = lastRect.y + lastRect.height;
-          page.drawCircle({ x: markerX, y: markerY, size: 7, color });
+          page.drawCircle({ x: placement.center.x, y: placement.center.y, size: 7, color });
+          const origin = rotateVector(
+            { x: -bold.widthOfTextAtSize(marker, markerSize) / 2, y: -bold.heightAtSize(markerSize) / 2 },
+            placement.textRotation
+          );
           page.drawText(marker, {
-            x: markerX - bold.widthOfTextAtSize(marker, markerSize) / 2,
-            y: markerY - bold.heightAtSize(markerSize) / 2,
+            x: placement.center.x + origin.x,
+            y: placement.center.y + origin.y,
             size: markerSize,
             font: bold,
-            color: rgb(1, 1, 1)
+            color: rgb(1, 1, 1),
+            rotate: degrees(placement.textRotation)
           });
         }
       } else {

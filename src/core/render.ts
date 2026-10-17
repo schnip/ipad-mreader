@@ -1,4 +1,5 @@
 import type { PdfDocument, PdfRenderJob } from "./doc";
+import { isRenderingCancelled } from "./math";
 
 export interface PageRenderSpec {
   pageNumber: number;
@@ -59,15 +60,20 @@ export class WeightedLruCache<Key, Value> {
     return entry.value;
   }
 
+  /**
+   * Stores `value`, evicting least-recently-used entries over budget. A value
+   * that can never fit is rejected and leaves the cache, including any
+   * existing entry for `key`, unchanged; the caller still owns it.
+   */
   set(key: Key, value: Value, weight: number): boolean {
-    const boundedWeight = Math.max(0, weight);
+    const boundedWeight = Math.max(0, Number.isFinite(weight) ? weight : 0);
+    if (this.maximumEntries <= 0 || boundedWeight > this.maximumWeight) return false;
     const existing = this.entries.get(key);
     if (existing) {
       this.totalWeight -= existing.weight;
       this.entries.delete(key);
       if (existing.value !== value) this.dispose?.(existing.value);
     }
-    if (this.maximumEntries <= 0 || boundedWeight > this.maximumWeight) return false;
     this.entries.set(key, { value, weight: boundedWeight });
     this.totalWeight += boundedWeight;
     this.trim();
@@ -105,10 +111,7 @@ export class SettledPageRenderer {
   private activeJob?: PdfRenderJob;
 
   constructor(maximumEntries = 7, maximumBytes = 96 * 1024 * 1024) {
-    this.cache = new WeightedLruCache(maximumEntries, maximumBytes, (surface) => {
-      surface.canvas.width = 1;
-      surface.canvas.height = 1;
-    });
+    this.cache = new WeightedLruCache(maximumEntries, maximumBytes, (surface) => releaseCanvas(surface.canvas));
   }
 
   async settle(pdf: PdfDocument, specs: readonly PageRenderSpec[]): Promise<void> {
@@ -159,16 +162,31 @@ export class SettledPageRenderer {
     try {
       await job.promise;
     } catch (error) {
+      releaseCanvas(surface);
       if (isRenderingCancelled(error)) return;
       throw error;
     } finally {
       if (this.activeJob === job) this.activeJob = undefined;
     }
-    if (generation !== this.generation) return;
+    if (generation !== this.generation) {
+      releaseCanvas(surface);
+      return;
+    }
     drawSurface(surface, spec);
     const bytes = surface.width * surface.height * 4;
-    this.cache.set(key, { canvas: surface, bytes }, bytes);
+    if (!this.cache.set(key, { canvas: surface, bytes }, bytes)) releaseCanvas(surface);
   }
+}
+
+/** Shrinks a canvas's backing store so WebKit can reclaim it before GC. */
+export function releaseCanvas(canvas: HTMLCanvasElement): void {
+  canvas.width = 1;
+  canvas.height = 1;
+}
+
+/** Device-pixel ratio for a raster, at least 1 and at most `cap`. */
+export function rasterDpr(devicePixelRatio: number, cap: number): number {
+  return Math.min(Math.max(Number.isFinite(devicePixelRatio) ? devicePixelRatio : 1, 1), cap);
 }
 
 function drawSurface(surface: HTMLCanvasElement, spec: PageRenderSpec): void {
@@ -180,8 +198,4 @@ function drawSurface(surface: HTMLCanvasElement, spec: PageRenderSpec): void {
   if (!context) throw new Error("A 2D canvas context is required to display a PDF page.");
   context.drawImage(surface, 0, 0);
   spec.canvas.hidden = false;
-}
-
-function isRenderingCancelled(error: unknown): boolean {
-  return error instanceof Error && error.name === "RenderingCancelledException";
 }

@@ -22,6 +22,10 @@ export async function importPdf(file: File, id = createDocumentId()): Promise<St
   if (file.size === 0) throw new Error("The selected PDF is empty.");
   const directory = await documentsDirectory();
   const handle = await directory.getFileHandle(fileName(id), { create: true });
+  if (typeof handle.createWritable !== "function") {
+    await directory.removeEntry(fileName(id)).catch(() => undefined);
+    throw new Error("This browser version cannot write files to device storage. Update iPadOS/Safari to import PDFs.");
+  }
   try {
     const writable = await handle.createWritable();
     await file.stream().pipeTo(writable);
@@ -39,10 +43,53 @@ export async function readPdf(id: string): Promise<Uint8Array> {
   const directory = await documentsDirectory();
   try {
     const handle = await directory.getFileHandle(fileName(id));
+    // pdf.js takes ownership of a whole-buffer Uint8Array and transfers it to
+    // its worker, so the main thread does not keep a second copy.
     return new Uint8Array(await (await handle.getFile()).arrayBuffer());
   } catch (error) {
     throw new Error(`Stored PDF ${id} is unavailable: ${errorMessage(error)}`, { cause: error });
   }
+}
+
+export interface StorageReport {
+  fileCount: number;
+  totalBytes: number;
+  /** Stored PDFs that no sidecar references, e.g. left by an interrupted import. */
+  orphanIds: string[];
+  orphanBytes: number;
+  /** Extra copies of the same PDF (by fingerprint) imported more than once. */
+  duplicateIds: string[];
+  duplicateBytes: number;
+}
+
+/**
+ * Read-only storage diagnostic. It never deletes anything: originals and
+ * sidecars are only reported so the space they use is visible.
+ */
+export function storageReport(
+  files: readonly StoredPdfFile[],
+  sidecars: readonly { id: string; fingerprint?: string; lastOpenedAt: number }[]
+): StorageReport {
+  const sizes = new Map(files.map((file) => [file.id, file.size]));
+  const referenced = new Set(sidecars.map((sidecar) => sidecar.id));
+  const orphanIds = files.filter((file) => !referenced.has(file.id)).map((file) => file.id).sort();
+  const seen = new Set<string>();
+  const duplicateIds: string[] = [];
+  for (const sidecar of [...sidecars].sort((a, b) => b.lastOpenedAt - a.lastOpenedAt)) {
+    const fingerprint = sidecar.fingerprint?.trim();
+    if (!fingerprint || !sizes.has(sidecar.id)) continue;
+    if (seen.has(fingerprint)) duplicateIds.push(sidecar.id);
+    else seen.add(fingerprint);
+  }
+  const bytes = (ids: readonly string[]) => ids.reduce((total, id) => total + (sizes.get(id) ?? 0), 0);
+  return {
+    fileCount: files.length,
+    totalBytes: files.reduce((total, file) => total + file.size, 0),
+    orphanIds,
+    orphanBytes: bytes(orphanIds),
+    duplicateIds: duplicateIds.sort(),
+    duplicateBytes: bytes(duplicateIds)
+  };
 }
 
 export async function listPdfs(): Promise<StoredPdfFile[]> {

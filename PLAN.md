@@ -54,7 +54,7 @@ Grid layout, worker-generated thumbnails, continuous threshold crossing during p
 
 Deferred center-tap bars with double-tap disambiguation, explicit ordered open-document tabs, non-destructive session close, per-document restore, Page/Grid controls, and subtle bounded grid-end bounce. Default reading state remains page-only and bars-hidden. P2's physically approved horizontal momentum remains unchanged except for bounded end displacement and spring settle; legal focus/virtualization state never leaves its bounds. The complete installed-iPad checklist passed.
 
-### P4 — layouts, Find, outline, and recents (implemented; focused device-patch retest pending)
+### P4 — layouts, Find, outline, and recents (complete, including physical sign-off)
 
 - Safe-area-aware single, two-up, cover-aware two-up, and vertically continuous layouts with mixed-size page geometry, spread-aware turns, exact focused-page persistence, and bounded full-resolution continuous virtualization.
 - Lifecycle-safe PDF text extraction, cancellable batched Find with progress/no-text reporting, result context, next/previous navigation, and non-interactive hit overlays.
@@ -62,14 +62,14 @@ Deferred center-tap bars with double-tap disambiguation, explicit ordered open-d
 - Subtle focal-coherent double-tap return-to-fit animation with immediate reduced-motion behavior, and suppression of visually meaningless page-width zoom.
 - Focused device patch: bounded pre-rasterized adjacent whole spreads with synchronous promotion, union-constrained spread zoom/pan, continuous release momentum, typing-safe shortcuts, owned panel scrolling, nested outline groups, fingerprint-aware Recents deduplication, and service-worker cache `mreader-p4-v2`.
 
-### P5 — annotations
+### P5 — annotations (complete, including physical sign-off)
 
 - Highlights, notes, custom selection handles, and an all-annotations index.
 - Pressure-varying Pencil ink. Cut ink rather than the project if web latency is unacceptable.
 
-P5 does not include document deletion/library management, save/export, or print. P4 deliberately provides no annotation, ink, text-selection, save, export, or print UI.
+P5 does not include document deletion/library management, save/export, or print; export and print belong to P6.
 
-### P6 — export, print, and embedded PDF links
+### P6 — export, print, and embedded PDF links (export and links implemented, device check pending; printing outstanding)
 
 Burn sidecar highlights, notes, and ink into a new PDF and send it through `navigator.share`; retain original bytes unchanged. Add browser printing. Render accessible, camera-aligned PDF link annotations in every reading layout: internal destinations navigate in-app, named page actions are bounded, and safe external URLs require explicit confirmation before opening. Link controls must not leak into reader gestures and are inactive in the thumbnail grid.
 

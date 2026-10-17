@@ -1,3 +1,5 @@
+import { isRecord } from "./math";
+
 export interface PdfOutlineNode {
   title: string;
   dest: unknown;
@@ -53,8 +55,4 @@ export function destinationTarget(destination: unknown): DestinationTarget | und
     return { kind: "reference", reference: { num: target.num, gen: target.gen } };
   }
   return undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
 }

@@ -1,9 +1,22 @@
 import { normalizeAnnotation, orderAnnotations } from "../core/annotations";
 import type { Annotation } from "../core/annotations";
+import { openDatabase, withStore } from "./idb";
+import type { DatabaseSpec } from "./idb";
 
-const DATABASE_NAME = "mreader-annotations";
-const DATABASE_VERSION = 1;
 const ANNOTATIONS_STORE = "annotations";
+
+const ANNOTATIONS_DATABASE: DatabaseSpec = {
+  name: "mreader-annotations",
+  version: 1,
+  label: "annotation",
+  upgrade(database) {
+    if (!database.objectStoreNames.contains(ANNOTATIONS_STORE)) {
+      const store = database.createObjectStore(ANNOTATIONS_STORE, { keyPath: "id" });
+      store.createIndex("documentId", "documentId");
+      store.createIndex("documentPage", ["documentId", "pageNumber"]);
+    }
+  }
+};
 
 export function normalizeStoredAnnotations(values: readonly unknown[], documentId?: string, pageNumber?: number): Annotation[] {
   return orderAnnotations(values
@@ -15,50 +28,30 @@ export function normalizeStoredAnnotations(values: readonly unknown[], documentI
 
 export async function listDocumentAnnotations(documentId: string): Promise<Annotation[]> {
   if (!documentId) return [];
-  const database = await openDatabase();
-  try {
-    const transaction = database.transaction(ANNOTATIONS_STORE, "readonly");
-    const complete = transactionComplete(transaction);
-    const values = await requestResult(transaction.objectStore(ANNOTATIONS_STORE).index("documentId").getAll(IDBKeyRange.only(documentId)));
-    await complete;
-    return normalizeStoredAnnotations(values, documentId);
-  } finally {
-    database.close();
-  }
+  const values: unknown[] = await withStore(ANNOTATIONS_DATABASE, ANNOTATIONS_STORE, "readonly", (store) => (
+    store.index("documentId").getAll(IDBKeyRange.only(documentId))
+  ));
+  return normalizeStoredAnnotations(values, documentId);
 }
 
 export async function listPageAnnotations(documentId: string, pageNumber: number): Promise<Annotation[]> {
   if (!documentId || !Number.isInteger(pageNumber) || pageNumber < 1) return [];
-  const database = await openDatabase();
-  try {
-    const transaction = database.transaction(ANNOTATIONS_STORE, "readonly");
-    const complete = transactionComplete(transaction);
-    const values = await requestResult(transaction.objectStore(ANNOTATIONS_STORE).index("documentPage").getAll(IDBKeyRange.only([documentId, pageNumber])));
-    await complete;
-    return normalizeStoredAnnotations(values, documentId, pageNumber);
-  } finally {
-    database.close();
-  }
+  const values: unknown[] = await withStore(ANNOTATIONS_DATABASE, ANNOTATIONS_STORE, "readonly", (store) => (
+    store.index("documentPage").getAll(IDBKeyRange.only([documentId, pageNumber]))
+  ));
+  return normalizeStoredAnnotations(values, documentId, pageNumber);
 }
 
 export async function putAnnotation(value: Annotation): Promise<Annotation> {
   const annotation = normalizeAnnotation(value);
   if (!annotation) throw new Error("The annotation is invalid.");
-  const database = await openDatabase();
-  try {
-    const transaction = database.transaction(ANNOTATIONS_STORE, "readwrite");
-    const complete = transactionComplete(transaction);
-    await requestResult(transaction.objectStore(ANNOTATIONS_STORE).put(annotation));
-    await complete;
-    return annotation;
-  } finally {
-    database.close();
-  }
+  await withStore(ANNOTATIONS_DATABASE, ANNOTATIONS_STORE, "readwrite", (store) => store.put(annotation));
+  return annotation;
 }
 
 export async function deleteAnnotation(documentId: string, annotationId: string): Promise<boolean> {
   if (!documentId || !annotationId) return false;
-  const database = await openDatabase();
+  const database = await openDatabase(ANNOTATIONS_DATABASE);
   try {
     return await new Promise<boolean>((resolve, reject) => {
       const transaction = database.transaction(ANNOTATIONS_STORE, "readwrite");
@@ -80,37 +73,4 @@ export async function deleteAnnotation(documentId: string, annotationId: string)
   } finally {
     database.close();
   }
-}
-
-function openDatabase(): Promise<IDBDatabase> {
-  if (!("indexedDB" in globalThis)) return Promise.reject(new Error("IndexedDB is unavailable in this browser."));
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
-    request.onerror = () => reject(request.error ?? new Error("Unable to open the annotation database."));
-    request.onblocked = () => reject(new Error("The annotation database upgrade is blocked by another app window."));
-    request.onupgradeneeded = () => {
-      const database = request.result;
-      if (!database.objectStoreNames.contains(ANNOTATIONS_STORE)) {
-        const store = database.createObjectStore(ANNOTATIONS_STORE, { keyPath: "id" });
-        store.createIndex("documentId", "documentId");
-        store.createIndex("documentPage", ["documentId", "pageNumber"]);
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-  });
-}
-
-function requestResult<T>(request: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed."));
-  });
-}
-
-function transactionComplete(transaction: IDBTransaction): Promise<void> {
-  return new Promise((resolve, reject) => {
-    transaction.oncomplete = () => resolve();
-    transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB transaction was aborted."));
-    transaction.onerror = () => reject(transaction.error ?? new Error("IndexedDB transaction failed."));
-  });
 }

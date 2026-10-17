@@ -2,14 +2,18 @@ import { AnnotationType, GlobalWorkerOptions, getDocument } from "pdfjs-dist";
 import type { PDFDocumentLoadingTask, PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import type { Size } from "./layout";
+import { errorMessage } from "./math";
 import { destinationTarget } from "./outline";
 import type { PdfOutlineNode } from "./outline";
 import { extractPdfLinks } from "./links";
 import type { PdfLink } from "./links";
+import { WeightedLruCache } from "./render";
 import { transformedTextBounds } from "./search";
 import type { SearchPageText, SearchTextItem } from "./search";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
+
+export { isRenderingCancelled } from "./math";
 
 export interface PdfDescriptor {
   id: string;
@@ -53,11 +57,15 @@ export class PdfPageHandle {
   }
 }
 
+/** Number of extracted page texts kept for overlay refreshes and selection. */
+const TEXT_CACHE_ENTRIES = 32;
+
 export class PdfDocument {
   private static readonly maximumRetainedPages = 12;
   private readonly pages = new Map<number, Promise<PdfPageHandle>>();
   private readonly sizes = new Map<number, Size>();
   private readonly links = new Map<number, Promise<PdfLink[]>>();
+  private readonly texts = new WeightedLruCache<number, SearchPageText>(TEXT_CACHE_ENTRIES, Number.POSITIVE_INFINITY);
 
   private constructor(
     readonly descriptor: PdfDescriptor,
@@ -65,6 +73,7 @@ export class PdfDocument {
     private readonly document: PDFDocumentProxy
   ) {}
 
+  /** Opens `bytes`; pdf.js takes ownership of and transfers the buffer. */
   static async open(bytes: Uint8Array, descriptor: PdfDescriptor): Promise<PdfDocument> {
     if (bytes.byteLength === 0) throw new Error("The selected PDF is empty.");
     const loadingTask = getDocument({ data: bytes });
@@ -73,7 +82,7 @@ export class PdfDocument {
       return new PdfDocument(descriptor, loadingTask, document);
     } catch (error) {
       await loadingTask.destroy();
-      throw new Error(`Unable to open ${descriptor.name}: ${errorMessage(error)}`, { cause: error });
+      throw new Error(`Unable to open ${descriptor.name}: ${openFailureMessage(error)}`, { cause: error });
     }
   }
 
@@ -86,9 +95,7 @@ export class PdfDocument {
   }
 
   page(pageNumber: number): Promise<PdfPageHandle> {
-    if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > this.pageCount) {
-      return Promise.reject(new RangeError(`PDF page ${pageNumber} is outside 1-${this.pageCount}.`));
-    }
+    if (!this.isPageNumber(pageNumber)) return Promise.reject(this.rangeError(pageNumber));
     const existing = this.pages.get(pageNumber);
     if (existing) {
       this.pages.delete(pageNumber);
@@ -106,29 +113,25 @@ export class PdfDocument {
   }
 
   async pageSize(pageNumber: number): Promise<Size> {
-    if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > this.pageCount) {
-      throw new RangeError(`PDF page ${pageNumber} is outside 1-${this.pageCount}.`);
-    }
+    this.assertPageNumber(pageNumber);
     const known = this.sizes.get(pageNumber);
     if (known) return known;
     const retained = this.pages.get(pageNumber);
     if (retained) return (await retained).size;
-    const page = await this.document.getPage(pageNumber);
-    try {
+    return this.withTransientPage(pageNumber, (page) => {
       const viewport = page.getViewport({ scale: 1 });
       const size = { width: viewport.width, height: viewport.height };
       this.sizes.set(pageNumber, size);
       return size;
-    } finally {
-      page.cleanup();
-    }
+    });
   }
 
   async pageText(pageNumber: number, signal?: AbortSignal): Promise<SearchPageText> {
     this.assertPageNumber(pageNumber);
     throwIfAborted(signal);
-    const page = await this.document.getPage(pageNumber);
-    try {
+    const cached = this.texts.get(pageNumber);
+    if (cached) return cached;
+    const text = await this.withTransientPage(pageNumber, async (page) => {
       throwIfAborted(signal);
       const viewport = page.getViewport({ scale: 1 });
       const content = await page.getTextContent({ disableNormalization: false });
@@ -136,12 +139,12 @@ export class PdfDocument {
       const items: SearchTextItem[] = content.items.flatMap((item) => {
         if (!("str" in item) || item.str.length === 0) return [];
         const bounds = transformedTextBounds(item.transform, viewport.transform, item.width, item.height);
-        return [{ text: item.str, ...bounds }];
+        return [{ text: item.str, ...bounds, ...(item.hasEOL ? { endOfLine: true } : {}) }];
       });
       return { pageNumber, width: viewport.width, height: viewport.height, items };
-    } finally {
-      page.cleanup();
-    }
+    });
+    this.texts.set(pageNumber, text, 1);
+    return text;
   }
 
   async outline(): Promise<PdfOutlineNode[]> {
@@ -153,13 +156,9 @@ export class PdfDocument {
     this.assertPageNumber(pageNumber);
     const existing = this.links.get(pageNumber);
     if (existing) return existing;
-    const pending = this.document.getPage(pageNumber).then(async (page) => {
-      try {
-        const viewport = page.getViewport({ scale: 1 });
-        return extractPdfLinks(await page.getAnnotations({ intent: "display" }), AnnotationType.LINK, viewport);
-      } finally {
-        page.cleanup();
-      }
+    const pending = this.withTransientPage(pageNumber, async (page) => {
+      const viewport = page.getViewport({ scale: 1 });
+      return extractPdfLinks(await page.getAnnotations({ intent: "display" }), AnnotationType.LINK, viewport);
     });
     this.links.set(pageNumber, pending);
     void pending.catch(() => this.links.delete(pageNumber));
@@ -167,7 +166,7 @@ export class PdfDocument {
   }
 
   async resolveDestination(destination: unknown): Promise<number | undefined> {
-    const resolved = typeof destination === "string" ? await this.document.getDestination(destination) : destination;
+    const resolved: unknown = typeof destination === "string" ? await this.document.getDestination(destination) : destination;
     const target = destinationTarget(resolved);
     if (!target) return undefined;
     try {
@@ -175,7 +174,7 @@ export class PdfDocument {
         ? target.index
         : await this.document.getPageIndex(target.reference);
       const page = index + 1;
-      return page >= 1 && page <= this.pageCount ? page : undefined;
+      return this.isPageNumber(page) ? page : undefined;
     } catch {
       return undefined;
     }
@@ -188,18 +187,39 @@ export class PdfDocument {
     this.pages.clear();
     this.sizes.clear();
     this.links.clear();
+    this.texts.clear();
     await this.loadingTask.destroy();
   }
 
-  private assertPageNumber(pageNumber: number): void {
-    if (!Number.isInteger(pageNumber) || pageNumber < 1 || pageNumber > this.pageCount) {
-      throw new RangeError(`PDF page ${pageNumber} is outside 1-${this.pageCount}.`);
+  /**
+   * Runs `operation` on a page proxy that the renderer may not be holding.
+   * pdf.js returns one shared proxy per page, so cleaning it up while a
+   * retained handle exists would discard the renderer's decoded resources.
+   */
+  private async withTransientPage<T>(pageNumber: number, operation: (page: PDFPageProxy) => T | Promise<T>): Promise<T> {
+    const page = await this.document.getPage(pageNumber);
+    try {
+      return await operation(page);
+    } finally {
+      if (!this.pages.has(pageNumber)) page.cleanup();
     }
+  }
+
+  private isPageNumber(pageNumber: number): boolean {
+    return Number.isInteger(pageNumber) && pageNumber >= 1 && pageNumber <= this.pageCount;
+  }
+
+  private rangeError(pageNumber: number): RangeError {
+    return new RangeError(`PDF page ${pageNumber} is outside 1-${this.pageCount}.`);
+  }
+
+  private assertPageNumber(pageNumber: number): void {
+    if (!this.isPageNumber(pageNumber)) throw this.rangeError(pageNumber);
   }
 
   private trimRetainedPages(): void {
     while (this.pages.size > PdfDocument.maximumRetainedPages) {
-      const oldest = this.pages.entries().next().value as [number, Promise<PdfPageHandle>] | undefined;
+      const oldest = this.pages.entries().next().value;
       if (!oldest) return;
       this.pages.delete(oldest[0]);
       void oldest[1].then((page) => page.cleanup()).catch(() => undefined);
@@ -207,8 +227,12 @@ export class PdfDocument {
   }
 }
 
-export function isRenderingCancelled(error: unknown): boolean {
-  return error instanceof Error && error.name === "RenderingCancelledException";
+/** Readable reasons for the pdf.js open failures a user can act on. */
+export function openFailureMessage(error: unknown): string {
+  const name = error instanceof Error ? error.name : "";
+  if (name === "PasswordException") return "it is password-protected, which mreader does not support yet.";
+  if (name === "InvalidPDFException") return "it is not a valid PDF file.";
+  return errorMessage(error);
 }
 
 function renderJob(task: RenderTask, width: number, height: number): PdfRenderJob {
@@ -218,10 +242,6 @@ function renderJob(task: RenderTask, width: number, height: number): PdfRenderJo
     promise: task.promise,
     cancel: () => task.cancel()
   };
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

@@ -9,7 +9,7 @@ import { adjacentSpreadSlots, constrainContinuousScroll, continuousPageAtViewpor
 import type { ContinuousLayout, Insets, PageLayout, ReaderLayout, Size } from "./core/layout";
 import { cameraForPagePoint, constrainCamera, moveCamera, normalizedPageCenter, sceneToScreen, screenToScene, zoomCameraAt } from "./core/scene";
 import type { Camera, Point } from "./core/scene";
-import { SettledPageRenderer, boundedRasterMultiplier } from "./core/render";
+import { SettledPageRenderer, boundedRasterMultiplier, rasterDpr } from "./core/render";
 import type { PageRenderSpec } from "./core/render";
 import { GRID_EXIT_SCALE, GRID_REST_SCALE, MIN_SEMANTIC_SCALE, gridLayerOpacity, interpolateSemanticTransform, readingLayerOpacity, semanticScale, semanticTransitionProgress, semanticViewMode } from "./core/semantic";
 import type { SemanticViewMode } from "./core/semantic";
@@ -17,21 +17,35 @@ import { ThumbnailRenderer } from "./core/thumbs";
 import type { ThumbnailRenderSpec } from "./core/thumbs";
 import { isViewControlActive } from "./core/view-controls";
 import { flattenOutline, outlineTreeStructure } from "./core/outline";
-import type { FlatOutlineItem, OutlineTreeItem, PdfOutlineNode } from "./core/outline";
-import { pageForPdfAction } from "./core/links";
-import type { PdfLink, PdfLinkAction } from "./core/links";
-import { SearchGeneration, normalizeSearchText, searchPages } from "./core/search";
-import type { SearchHit, SearchPageText } from "./core/search";
-import { DEFAULT_HIGHLIGHT_COLOR, DEFAULT_INK_COLOR, DEFAULT_NOTE_COLOR, annotationMetadata, annotationsForPage, appendInkPoint, characterHitTest, inkSegments, normalizeAnnotation, orderAnnotations, selectionContainsPoint, selectionRangeGeometry } from "./core/annotations";
+import type { FlatOutlineItem, PdfOutlineNode } from "./core/outline";
+import type { SearchPageText } from "./core/search";
+import { DEFAULT_HIGHLIGHT_COLOR, DEFAULT_INK_COLOR, DEFAULT_NOTE_COLOR, annotationMetadata, annotationsForPage, appendInkPoint, characterHitTest, inkSegments, normalizeAnnotation, normalizeNote, orderAnnotations, selectionContainsPoint, selectionRangeGeometry } from "./core/annotations";
 import type { Annotation, InkPoint, NormalizedPoint, NoteAnnotation, SelectionGeometry, TextPosition } from "./core/annotations";
 import { exportAnnotatedPdf } from "./core/export";
-import { deletePdf, importPdf, listPdfs, readPdf } from "./store/opfs";
+import { errorMessage, errorName, formatBytes } from "./core/math";
+import {
+  AXIS_DOMINANCE_RATIO, CHROME_TAP_DELAY_MS, CONTINUOUS_DPR_CAP, CONTINUOUS_MOMENTUM_MIN_VELOCITY, CONTINUOUS_RELEASE_GAIN,
+  DEFAULT_PEN_PRESSURE, DRAG_ACTIVATION_PX, EDGE_TOUCH_PX, FIT_SCALE_TOLERANCE, GRID_BOUNCE_PROJECTION_MS, GRID_BOUND_EPSILON_PX,
+  GRID_MOMENTUM_MIN_VELOCITY, GRID_MOMENTUM_STOP_VELOCITY, GRID_RELEASE_GAIN, GRID_REST_EPSILON_PX, GRID_SPRING_HANDOFF,
+  INK_BASE_WIDTH, LONG_PRESS_MS, MIN_TRANSITION_SCALE, PAGE_DPR_CAP, PAGE_VELOCITY_SAMPLE_WEIGHT,
+  PANEL_MOMENTUM_MIN_VELOCITY, PANEL_MOMENTUM_STOP_VELOCITY, PANEL_RELEASE_GAIN, PEN_TOUCH_SUPPRESSION_MS, POSITION_SAVE_DEBOUNCE_MS,
+  PREFETCH_THUMBNAIL_DPR, REDUCED_MOTION_SETTLE, SCROLL_VELOCITY_SAMPLE_WEIGHT, SELECTION_HIT_TOLERANCE,
+  SELECTION_TOUCH_PAD, SEMANTIC_SETTLE_MS, STATUS_BRIEF_MS, STATUS_DEFAULT_MS, STATUS_ERROR_MS, STATUS_LONG_MS, STATUS_MEDIUM_MS,
+  STATUS_SHORT_MS, TAP_MAX_DURATION_MS, TAP_MOVEMENT_PX, THUMBNAIL_DPR_CAP
+} from "./core/tuning";
+import { deletePdf, importPdf, listPdfs, readPdf, storageReport } from "./store/opfs";
 import { dedupeRecentDocuments, defaultReadingPosition, deleteDocumentSidecar, listRecentDocuments, putDocumentSidecar, updateReadingPosition } from "./store/sidecar";
 import type { DocumentSidecar, FitState, ReadingPosition } from "./store/sidecar";
 import { addOpenDocument, closeOpenDocument, emptyOpenSession, loadOpenSession, normalizeOpenSession, saveOpenSession, selectOpenDocument } from "./store/session";
 import type { OpenDocumentSession } from "./store/session";
 import { deleteAnnotation, listDocumentAnnotations, putAnnotation } from "./store/annotations";
 import { platform } from "./platform";
+import { discardCanvas, documentElement, isControl, isTypingTarget, nextFrame, pixelValue, renderOutlineList, required, touchPoint, touchPoints, trapFocus, wait, writeClipboardText } from "./reader/dom";
+import { PanelController } from "./reader/panels";
+import type { PanelKind } from "./reader/panels";
+import { LinksController } from "./reader/links-controller";
+import { ImportQueue } from "./reader/import-queue";
+import { SearchController } from "./reader/search-controller";
 
 interface SingleTouch {
   startedAt: number;
@@ -58,6 +72,31 @@ interface CanvasSet {
   previous: HTMLCanvasElement;
   current: HTMLCanvasElement;
   next: HTMLCanvasElement;
+}
+
+/**
+ * Per-document view state. `activate` captures it before switching documents
+ * and restores it if the new document cannot be shown.
+ */
+interface DocumentViewState {
+  document?: PdfDocument;
+  sidecar?: DocumentSidecar;
+  page: number;
+  camera: Camera;
+  fit: FitState;
+  currentLayout?: PageLayout;
+  layouts: ReadonlyMap<number, PageLayout>;
+  gridLayout?: GridLayout;
+  pageSizes: Size[];
+  gridSizesReady: boolean;
+  gridOffset: number;
+  gridSyncedOffset: number;
+  gridFocusPage: number;
+  viewMode: SemanticViewMode;
+  layoutMode: ReaderLayout;
+  continuousLayout?: ContinuousLayout;
+  continuousScroll: number;
+  annotations: Annotation[];
 }
 
 interface TextSelectionState {
@@ -90,14 +129,8 @@ interface LiveInkSurface {
   renderedPointCount: number;
 }
 
-interface VisiblePdfLink {
-  link: PdfLink;
-  sourcePage: number;
-}
+const SVG_NS = "http://www.w3.org/2000/svg";
 
-const TAP_MOVEMENT = 10;
-const SELECTION_TOUCH_PAD = 0.012;
-const INK_BASE_WIDTH = 2.2;
 export class ReaderApplication {
   private readonly scene: HTMLElement;
   private readonly track: HTMLElement;
@@ -183,13 +216,8 @@ export class ReaderApplication {
   private openSession: OpenDocumentSession = emptyOpenSession();
   private readonly openSidecars = new Map<string, DocumentSidecar>();
   private recentSidecars: DocumentSidecar[] = [];
-  private readonly searchGenerations = new SearchGeneration();
-  private searchInputTimer?: number;
-  private searchHits: SearchHit[] = [];
-  private activeSearchHit = -1;
-  private hitOverlayGeneration = 0;
-  private linkOverlayGeneration = 0;
-  private readonly visiblePdfLinks = new Map<string, VisiblePdfLink>();
+  private readonly search: SearchController;
+  private readonly links: LinksController;
   private outlineNodes?: PdfOutlineNode[];
   private flatOutline: FlatOutlineItem[] = [];
   private panelScrollTouch?: { element: HTMLElement; lastY: number; lastAt: number; velocity: number };
@@ -206,10 +234,10 @@ export class ReaderApplication {
   private ink?: InkState;
   private liveInkSurface?: LiveInkSurface;
   private editingNoteId?: string;
-  private readonly pendingPdfImports: File[] = [];
-  private importsReady = false;
-  private importQueueRunning = false;
-  private importRetryTimer?: number;
+  private noteDraft?: { documentId: string; pageNumber: number; geometry: SelectionGeometry };
+  private readonly panels: PanelController;
+  private pendingExport?: { file: File; skipped: number; sidecarId: string };
+  private readonly importQueue = new ImportQueue(() => this.opening, (file) => this.importPdfFile(file));
 
   constructor(private readonly root: HTMLElement) {
     root.innerHTML = this.markup();
@@ -247,6 +275,37 @@ export class ReaderApplication {
       current: required(root, "#current-page"),
       next: required(root, "#next-page")
     };
+    this.panels = new PanelController({
+      find: this.findPanel,
+      more: this.morePanel,
+      drawer: this.drawerPanel,
+      note: this.annotationEditor,
+      backdrop: this.panelBackdrop
+    }, (kind) => this.onPanelClosed(kind));
+    this.search = new SearchController({
+      input: this.findInput,
+      results: this.findResults,
+      summary: this.findSummary,
+      hitLayers: [this.pageHitLayer, this.continuousHitLayer]
+    }, {
+      currentDocument: () => this.document,
+      visibleTargets: () => this.searchTargets(),
+      goToPage: (pageNumber) => this.goToPage(pageNumber)
+    });
+    this.links = new LinksController([this.pageLinkLayer, this.continuousLinkLayer], {
+      currentDocument: () => this.document,
+      linksActive: () => this.viewMode === "reading",
+      activeLayer: () => this.layoutMode === "continuous" ? this.continuousLinkLayer : this.pageLinkLayer,
+      visibleTargets: () => this.visibleOverlayTargets(),
+      claimInput: () => {
+        this.clearPendingTap();
+        this.cancelTouches();
+      },
+      goToPage: (pageNumber) => this.goToPage(pageNumber),
+      openExternalUrl: (url) => platform.openExternalUrl(url),
+      confirm: (message) => window.confirm(message),
+      reportUnavailable: () => this.showStatus("This PDF link destination is unavailable.", true, STATUS_ERROR_MS)
+    });
     this.installEvents();
   }
 
@@ -261,8 +320,7 @@ export class ReaderApplication {
     void platform.registerServiceWorker();
     await this.restoreSession();
     await deliverStartupIngress();
-    this.importsReady = true;
-    this.drainPdfImports();
+    this.importQueue.start();
   }
 
   private markup(): string {
@@ -327,6 +385,7 @@ export class ReaderApplication {
               <button id="recents-open" type="button">Recents</button>
               <button id="annotations-open" type="button">Annotations</button>
               <button id="export-open" type="button">Export annotated copy</button>
+              <button id="storage-open" type="button">Storage</button>
             </div>
           </section>
           <section id="drawer-panel" class="reader-panel drawer-panel reader-control" data-reader-control role="dialog" aria-modal="false" aria-labelledby="drawer-title" hidden>
@@ -367,25 +426,18 @@ export class ReaderApplication {
     required<HTMLButtonElement>(this.root, "#drawer-close").addEventListener("click", () => this.closePanels());
     required<HTMLFormElement>(this.root, "#find-form").addEventListener("submit", (event) => {
       event.preventDefault();
-      void this.runSearch();
+      void this.search.run();
     });
-    this.findInput.addEventListener("input", () => {
-      this.searchGenerations.cancel();
-      if (this.searchInputTimer !== undefined) window.clearTimeout(this.searchInputTimer);
-      this.searchInputTimer = window.setTimeout(() => {
-        this.searchInputTimer = undefined;
-        void this.runSearch();
-      }, 220);
-    });
-    required<HTMLButtonElement>(this.root, "#find-previous").addEventListener("click", () => void this.moveSearchHit(-1));
-    required<HTMLButtonElement>(this.root, "#find-next").addEventListener("click", () => void this.moveSearchHit(1));
-    this.findResults.addEventListener("click", (event) => void this.selectSearchResult(event));
+    this.findInput.addEventListener("input", () => this.search.onInput());
+    required<HTMLButtonElement>(this.root, "#find-previous").addEventListener("click", () => void this.search.move(-1));
+    required<HTMLButtonElement>(this.root, "#find-next").addEventListener("click", () => void this.search.move(1));
+    this.findResults.addEventListener("click", (event) => void this.search.selectResult(event));
     this.morePanel.addEventListener("click", (event) => void this.onMoreAction(event));
     this.drawerContent.addEventListener("click", (event) => void this.onDrawerAction(event));
     this.pageAnnotationLayer.addEventListener("click", (event) => this.onAnnotationLayerAction(event));
     this.continuousAnnotationLayer.addEventListener("click", (event) => this.onAnnotationLayerAction(event));
-    this.pageLinkLayer.addEventListener("click", (event) => this.onPdfLinkAction(event));
-    this.continuousLinkLayer.addEventListener("click", (event) => this.onPdfLinkAction(event));
+    this.pageLinkLayer.addEventListener("click", (event) => this.links.onActivate(event));
+    this.continuousLinkLayer.addEventListener("click", (event) => this.links.onActivate(event));
     required<HTMLButtonElement>(this.root, "#selection-copy").addEventListener("click", () => void this.copySelection());
     required<HTMLButtonElement>(this.root, "#selection-highlight").addEventListener("click", () => void this.createHighlight());
     required<HTMLButtonElement>(this.root, "#selection-note").addEventListener("click", () => this.openNoteEditor());
@@ -401,6 +453,13 @@ export class ReaderApplication {
           const scrollable = event.target instanceof Element
             ? event.target.closest<HTMLElement>(".panel-list,.drawer-content")
             : null;
+          // The note textarea keeps native touch behavior so it can scroll and
+          // place or drag the caret; it is still isolated from reader gestures.
+          const nativeTextInput = event.target instanceof Element && event.target.closest("textarea") !== null;
+          if (nativeTextInput) {
+            event.stopPropagation();
+            return;
+          }
           if (eventName === "touchstart") {
             this.cancelContinuousMomentum();
             this.cancelPanelMomentum();
@@ -422,7 +481,7 @@ export class ReaderApplication {
                 tracked.element.scrollHeight,
                 tracked.element.clientHeight
               );
-              tracked.velocity = tracked.velocity * 0.65 + (-delta / elapsed) * 0.35;
+              tracked.velocity = tracked.velocity * (1 - SCROLL_VELOCITY_SAMPLE_WEIGHT) + (-delta / elapsed) * SCROLL_VELOCITY_SAMPLE_WEIGHT;
               tracked.lastY = touch.clientY;
               tracked.lastAt = now;
             }
@@ -456,6 +515,17 @@ export class ReaderApplication {
       if (document.visibilityState === "hidden") void this.flushPosition();
     });
     window.addEventListener("keydown", (event) => void this.onKeyDown(event));
+    // Fire-and-forget work (`void this.…()`) must not fail silently. Expected
+    // cancellations are ignored; anything else is logged and surfaced.
+    window.addEventListener("unhandledrejection", (event) => {
+      const name = errorName(event.reason);
+      if (name === "AbortError" || name === "RenderingCancelledException") {
+        event.preventDefault();
+        return;
+      }
+      console.error("Unhandled reader error", event.reason);
+      this.showStatus(`Something went wrong: ${errorMessage(event.reason)}`, true, STATUS_ERROR_MS);
+    });
   }
 
   private importSelected(): void {
@@ -465,28 +535,7 @@ export class ReaderApplication {
   }
 
   private enqueuePdfImports(files: readonly File[]): void {
-    this.pendingPdfImports.push(...files);
-    this.drainPdfImports();
-  }
-
-  private drainPdfImports(): void {
-    if (!this.importsReady || this.importQueueRunning || this.pendingPdfImports.length === 0) return;
-    if (this.opening) {
-      if (this.importRetryTimer === undefined) {
-        this.importRetryTimer = window.setTimeout(() => {
-          this.importRetryTimer = undefined;
-          this.drainPdfImports();
-        }, 100);
-      }
-      return;
-    }
-    const file = this.pendingPdfImports.shift();
-    if (!file) return;
-    this.importQueueRunning = true;
-    void this.importPdfFile(file).finally(() => {
-      this.importQueueRunning = false;
-      this.drainPdfImports();
-    });
+    this.importQueue.enqueue(files);
   }
 
   private async importPdfFile(file: File): Promise<void> {
@@ -499,7 +548,8 @@ export class ReaderApplication {
       if (file.type && file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
         throw new Error("Choose a PDF file.");
       }
-      void navigator.storage.persist?.().catch(() => false);
+      // `navigator.storage` is missing outside secure contexts; importPdf then reports why.
+      void (navigator.storage as StorageManager | undefined)?.persist?.().catch(() => false);
       const stored = await importPdf(file);
       storedId = stored.id;
       const bytes = await readPdf(stored.id);
@@ -526,7 +576,7 @@ export class ReaderApplication {
       await saveOpenSession(this.openSession).catch((error) => console.warn("Unable to persist open document session", error));
       this.renderChrome();
       storedId = undefined;
-      this.showStatus(`${file.name} imported`, false, 1800);
+      this.showStatus(`${file.name} imported`, false, STATUS_DEFAULT_MS);
     } catch (error) {
       this.showStatus(errorMessage(error), true);
       await pendingDocument?.destroy().catch(() => undefined);
@@ -666,13 +716,16 @@ export class ReaderApplication {
     this.cancelAnnotationInteraction();
     this.annotationGeneration += 1;
     this.annotations = [];
-    for (const canvas of Object.values(this.canvases)) canvas.hidden = true;
+    for (const canvas of [this.canvases.previous, this.canvases.current, this.canvases.next]) canvas.hidden = true;
     this.gridLayer.hidden = true;
     this.emptyState.hidden = false;
     await document?.destroy().catch(() => undefined);
   }
 
   private async activate(document: PdfDocument, sidecar: DocumentSidecar): Promise<void> {
+    // Persist the outgoing document first. A debounced save firing while this
+    // method swaps state would combine the old camera with the new document.
+    if (this.sidecar !== sidecar) await this.flushPosition();
     this.clearPendingTap();
     this.setChromeVisible(false);
     this.closePanels();
@@ -681,24 +734,10 @@ export class ReaderApplication {
     this.cancelAnnotationInteraction();
     this.outlineNodes = undefined;
     this.flatOutline = [];
-    const previous = this.document;
-    const previousSidecar = this.sidecar;
-    const previousPage = this.page;
-    const previousCamera = this.camera;
-    const previousFit = this.fit;
-    const previousLayout = this.currentLayout;
-    const previousLayouts = new Map(this.layouts);
-    const previousGridLayout = this.gridLayout;
-    const previousPageSizes = this.pageSizes;
-    const previousGridSizesReady = this.gridSizesReady;
-    const previousGridOffset = this.gridOffset;
-    const previousGridSyncedOffset = this.gridSyncedOffset;
-    const previousGridFocusPage = this.gridFocusPage;
-    const previousViewMode = this.viewMode;
-    const previousLayoutMode = this.layoutMode;
-    const previousContinuousLayout = this.continuousLayout;
-    const previousContinuousScroll = this.continuousScroll;
-    const previousAnnotations = this.annotations;
+    // Everything needed to put the outgoing document back if this one fails.
+    // Transient interaction state (grid overscroll/bounce/gesture, search,
+    // selection, ink) is deliberately reset rather than restored.
+    const previousState = this.captureViewState();
     this.renderer.cancel();
     this.thumbnailRenderer.cancel();
     this.cancelGridMomentum();
@@ -751,36 +790,17 @@ export class ReaderApplication {
       await this.refreshRendering();
     } catch (error) {
       this.renderer.cancel();
-      this.document = previous;
-      this.sidecar = previousSidecar;
-      this.page = previousPage;
-      this.camera = previousCamera;
-      this.fit = previousFit;
-      this.currentLayout = previousLayout;
-      this.gridLayout = previousGridLayout;
-      this.pageSizes = previousPageSizes;
-      this.gridSizesReady = previousGridSizesReady;
-      this.gridOffset = previousGridOffset;
-      this.gridSyncedOffset = previousGridSyncedOffset;
-      this.gridFocusPage = previousGridFocusPage;
-      this.viewMode = previousViewMode;
-      this.layoutMode = previousLayoutMode;
-      this.continuousLayout = previousContinuousLayout;
-      this.continuousScroll = previousContinuousScroll;
-      this.annotations = previousAnnotations;
+      this.restoreViewState(previousState);
       this.annotationGeneration += 1;
-      this.semanticZoom = previousViewMode === "grid" ? GRID_REST_SCALE : 1;
-      this.layouts.clear();
-      for (const [page, savedLayout] of previousLayouts) this.layouts.set(page, savedLayout);
       this.applyTransform();
-      if (previousViewMode === "grid") {
+      if (previousState.viewMode === "grid") {
         this.gridLayer.hidden = false;
         this.syncGridThumbnails();
       }
-      if (previous) await this.refreshRendering().catch(() => undefined);
+      if (previousState.document) await this.refreshRendering().catch(() => undefined);
       else {
         this.emptyState.hidden = false;
-        for (const canvas of Object.values(this.canvases)) canvas.hidden = true;
+        for (const canvas of [this.canvases.previous, this.canvases.current, this.canvases.next]) canvas.hidden = true;
       }
       await document.destroy().catch(() => undefined);
       throw error;
@@ -792,19 +812,71 @@ export class ReaderApplication {
     sidecar.fingerprint ??= document.fingerprint;
     this.recentSidecars = dedupeRecentDocuments([sidecar, ...this.recentSidecars.filter((item) => item.id !== sidecar.id)]);
     await putDocumentSidecar(sidecar).catch((error) => console.warn("Unable to update recent document state", error));
+    const previous = previousState.document;
     if (previous && previous !== document) await previous.destroy().catch(() => undefined);
     this.renderChrome();
   }
 
+  /** Snapshot of the per-document view state that `activate` can roll back to. */
+  private captureViewState(): DocumentViewState {
+    return {
+      document: this.document,
+      sidecar: this.sidecar,
+      page: this.page,
+      camera: this.camera,
+      fit: this.fit,
+      currentLayout: this.currentLayout,
+      layouts: new Map(this.layouts),
+      gridLayout: this.gridLayout,
+      pageSizes: this.pageSizes,
+      gridSizesReady: this.gridSizesReady,
+      gridOffset: this.gridOffset,
+      gridSyncedOffset: this.gridSyncedOffset,
+      gridFocusPage: this.gridFocusPage,
+      viewMode: this.viewMode,
+      layoutMode: this.layoutMode,
+      continuousLayout: this.continuousLayout,
+      continuousScroll: this.continuousScroll,
+      annotations: this.annotations
+    };
+  }
+
+  private restoreViewState(state: DocumentViewState): void {
+    this.document = state.document;
+    this.sidecar = state.sidecar;
+    this.page = state.page;
+    this.camera = state.camera;
+    this.fit = state.fit;
+    this.currentLayout = state.currentLayout;
+    this.layouts.clear();
+    for (const [page, layout] of state.layouts) this.layouts.set(page, layout);
+    this.gridLayout = state.gridLayout;
+    this.pageSizes = state.pageSizes;
+    this.gridSizesReady = state.gridSizesReady;
+    this.gridOffset = state.gridOffset;
+    this.gridSyncedOffset = state.gridSyncedOffset;
+    this.gridFocusPage = state.gridFocusPage;
+    this.viewMode = state.viewMode;
+    this.layoutMode = state.layoutMode;
+    this.continuousLayout = state.continuousLayout;
+    this.continuousScroll = state.continuousScroll;
+    this.annotations = state.annotations;
+    this.semanticZoom = state.viewMode === "grid" ? GRID_REST_SCALE : 1;
+  }
+
   private onPointerDown(event: PointerEvent): void {
     if (event.pointerType !== "pen") return;
+    // Controls own Pencil input like any other tap: the selection must survive
+    // so Copy/Highlight/Add note can act on it, and the note textarea must
+    // keep its default focus and Scribble behavior.
+    if (isControl(event.target)) return;
     event.preventDefault();
     this.penPointers.add(event.pointerId);
     this.suppressTouchesUntil = Number.POSITIVE_INFINITY;
     this.cancelTouches();
     this.cancelSelection();
     if (this.ink) this.cancelInk();
-    if (!this.document || !this.sidecar || this.opening || this.animating || this.viewMode !== "reading" || isControl(event.target)) {
+    if (!this.document || !this.sidecar || this.opening || this.animating || this.viewMode !== "reading") {
       this.removeLiveInkSurface();
       return;
     }
@@ -832,13 +904,13 @@ export class ReaderApplication {
   }
 
   private async onPointerEnd(event: PointerEvent, cancelled: boolean): Promise<void> {
-    if (event.pointerType !== "pen") return;
+    if (event.pointerType !== "pen" || !this.penPointers.has(event.pointerId)) return;
     event.preventDefault();
     const ink = this.ink?.pointerId === event.pointerId ? this.ink : undefined;
     if (ink && !cancelled) this.appendPointerInk(event);
     if (ink) this.ink = undefined;
     this.penPointers.delete(event.pointerId);
-    if (this.penPointers.size === 0) this.suppressTouchesUntil = performance.now() + 250;
+    if (this.penPointers.size === 0) this.suppressTouchesUntil = performance.now() + PEN_TOUCH_SUPPRESSION_MS;
     this.cancelTouches();
     if (!ink) return;
     if (cancelled || ink.points.length < 2 || ink.documentId !== this.sidecar?.id) {
@@ -874,8 +946,19 @@ export class ReaderApplication {
     this.cancelGridMomentum();
     this.cancelContinuousMomentum();
     this.applyTransform();
-    const edgeTouch = [...event.changedTouches].some((touch) => touch.clientX < 28 || touch.clientX > window.innerWidth - 28);
+    const edgeTouch = [...event.changedTouches].some((touch) => touch.clientX < EDGE_TOUCH_PX || touch.clientX > window.innerWidth - EDGE_TOUCH_PX);
     if (edgeTouch) event.preventDefault();
+    if (event.touches.length > 2) {
+      // A third finger ends a pinch rather than letting it resume later from
+      // stale distance/centre values, which made the camera jump.
+      event.preventDefault();
+      const pinch = this.pinchTouch;
+      this.pinchTouch = undefined;
+      this.singleTouch = undefined;
+      this.cancelLongPress();
+      if (pinch) this.recoverFromInterruptedPinch(pinch);
+      return;
+    }
     if (event.touches.length === 2) {
       event.preventDefault();
       this.cancelSelection();
@@ -912,7 +995,7 @@ export class ReaderApplication {
         if (insideSelection && hit) {
           event.preventDefault();
           this.selectionTouch = { mode: "extend", pageNumber: hit.pageNumber };
-          void this.updateSelectionAt(point, "extend");
+          this.updateSelectionAt(point, "extend");
           return;
         }
         this.pendingSelectionDismissal = this.selection;
@@ -941,7 +1024,7 @@ export class ReaderApplication {
     if (this.selectionTouch && event.touches.length === 1) {
       event.preventDefault();
       const point = touchPoint(event.touches[0]);
-      if (point) void this.updateSelectionAt(point, this.selectionTouch.mode);
+      if (point) this.updateSelectionAt(point, this.selectionTouch.mode);
       return;
     }
     if (event.touches.length === 2 && this.pinchTouch && this.currentLayout) {
@@ -1002,7 +1085,7 @@ export class ReaderApplication {
     const movedAt = performance.now();
     const movedIn = Math.max(1, movedAt - this.singleTouch.lastMovedAt);
     const delta = { x: current.x - this.singleTouch.start.x, y: current.y - this.singleTouch.start.y };
-    if (Math.hypot(delta.x, delta.y) >= 8) {
+    if (Math.hypot(delta.x, delta.y) >= DRAG_ACTIVATION_PX) {
       this.clearPendingTap();
       this.cancelLongPress();
       this.applyPendingSelectionDismissal();
@@ -1010,12 +1093,12 @@ export class ReaderApplication {
     this.singleTouch.latest = current;
     this.singleTouch.lastMovedAt = movedAt;
     if (this.viewMode === "grid") {
-      if (this.singleTouch.intent === "undecided" && Math.hypot(delta.x, delta.y) >= 8) {
-        this.singleTouch.intent = Math.abs(delta.x) > Math.abs(delta.y) * 1.15 ? "grid-pan" : "grid-ignore";
+      if (this.singleTouch.intent === "undecided" && Math.hypot(delta.x, delta.y) >= DRAG_ACTIVATION_PX) {
+        this.singleTouch.intent = Math.abs(delta.x) > Math.abs(delta.y) * AXIS_DOMINANCE_RATIO ? "grid-pan" : "grid-ignore";
       }
       if (this.singleTouch.intent === "grid-pan" && this.gridLayout) {
         const instantaneousVelocity = (current.x - previous.x) / movedIn;
-        this.singleTouch.gridVelocity = this.singleTouch.gridVelocity * 0.65 + instantaneousVelocity * 0.35;
+        this.singleTouch.gridVelocity = this.singleTouch.gridVelocity * (1 - SCROLL_VELOCITY_SAMPLE_WEIGHT) + instantaneousVelocity * SCROLL_VELOCITY_SAMPLE_WEIGHT;
         const reducedMotion = this.reducedMotion();
         const dragged = dragGridOffset(
           this.gridOffset,
@@ -1034,8 +1117,8 @@ export class ReaderApplication {
       return;
     }
     if (this.layoutMode === "continuous" && this.continuousLayout) {
-      if (this.singleTouch.intent === "undecided" && Math.hypot(delta.x, delta.y) >= 8) {
-        this.singleTouch.intent = Math.abs(delta.y) > Math.abs(delta.x) * 1.15 ? "continuous-pan" : "continuous-ignore";
+      if (this.singleTouch.intent === "undecided" && Math.hypot(delta.x, delta.y) >= DRAG_ACTIVATION_PX) {
+        this.singleTouch.intent = Math.abs(delta.y) > Math.abs(delta.x) * AXIS_DOMINANCE_RATIO ? "continuous-pan" : "continuous-ignore";
       }
       if (this.singleTouch.intent === "continuous-pan") {
         const bounds = continuousScrollBounds(this.continuousLayout, this.viewport());
@@ -1053,7 +1136,7 @@ export class ReaderApplication {
     if (this.singleTouch.intent === "undecided") this.singleTouch.intent = gestureIntent(delta, this.camera.scale);
     if (this.singleTouch.intent === "page-turn") {
       const instantaneousVelocity = (current.x - previous.x) / movedIn;
-      this.singleTouch.pageVelocity = this.singleTouch.pageVelocity * 0.55 + instantaneousVelocity * 0.45;
+      this.singleTouch.pageVelocity = this.singleTouch.pageVelocity * (1 - PAGE_VELOCITY_SAMPLE_WEIGHT) + instantaneousVelocity * PAGE_VELOCITY_SAMPLE_WEIGHT;
       this.swipeOffset = pageTurnDragOffset(delta.x, this.hasPage(delta.x < 0 ? 1 : -1));
     } else if (this.singleTouch.intent === "pan") {
       this.fit = "custom";
@@ -1095,26 +1178,29 @@ export class ReaderApplication {
         const settleMilliseconds = this.semanticSettleDuration();
         this.gridLayer.classList.add("semantic-settling");
         this.track.classList.add("semantic-settling");
-        this.semanticZoom = GRID_REST_SCALE;
-        this.camera = { x: 0, y: 0, scale: 1 };
-        this.fit = "page";
-        if (this.gridLayout) {
-          this.gridOffset = constrainGridOffset(this.gridOffset, this.gridLayout, this.viewport(), this.safeInsets());
+        try {
+          this.semanticZoom = GRID_REST_SCALE;
+          this.camera = { x: 0, y: 0, scale: 1 };
+          this.fit = "page";
+          if (this.gridLayout) {
+            this.gridOffset = constrainGridOffset(this.gridOffset, this.gridLayout, this.viewport(), this.safeInsets());
+          }
+          this.applyTransform();
+          this.syncGridThumbnails();
+          await Promise.all([
+            this.prepareFocusedPage(this.focusedGridPage({ x: this.viewport().width / 2, y: this.viewport().height / 2 })),
+            wait(settleMilliseconds)
+          ]);
+        } finally {
+          this.gridLayer.classList.remove("semantic-settling");
+          this.track.classList.remove("semantic-settling");
         }
-        this.applyTransform();
-        this.syncGridThumbnails();
-        await Promise.all([
-          this.prepareFocusedPage(this.focusedGridPage({ x: this.viewport().width / 2, y: this.viewport().height / 2 })),
-          wait(settleMilliseconds)
-        ]);
-        this.gridLayer.classList.remove("semantic-settling");
-        this.track.classList.remove("semantic-settling");
       } else if (startedIn === "grid") {
         await this.exitGrid(focusPage);
       } else {
         this.focusSpreadPage(focusPage);
         this.camera = constrainCamera(this.camera, this.cameraBoundsLayout() ?? this.currentLayout, this.viewport(), this.safeInsets());
-        if (this.camera.scale <= 1.01) this.setPageFit();
+        if (this.camera.scale <= FIT_SCALE_TOLERANCE) this.setPageFit();
         else this.fit = "custom";
         this.semanticZoom = 1;
         this.applyTransform();
@@ -1140,11 +1226,11 @@ export class ReaderApplication {
       endedAt - touch.lastMovedAt
     );
     if (this.viewMode === "grid") {
-      if (touch.intent === "undecided" && distance(touch.start, touch.latest) <= TAP_MOVEMENT && elapsedMs < 400) {
+      if (touch.intent === "undecided" && distance(touch.start, touch.latest) <= TAP_MOVEMENT_PX && elapsedMs < TAP_MAX_DURATION_MS) {
         const selected = this.gridLayout ? gridPageAtPoint(this.gridLayout, this.gridOffset, touch.latest) : undefined;
         if (selected) await this.exitGrid(selected);
       } else if (touch.intent === "grid-pan") {
-        if (Math.abs(this.gridBounce) > 0.01) {
+        if (Math.abs(this.gridBounce) > GRID_REST_EPSILON_PX) {
           this.startGridSpring(touch.gridVelocity);
         } else if (!this.startGridMomentum(touch.gridVelocity)) {
           this.syncGridThumbnails();
@@ -1154,7 +1240,7 @@ export class ReaderApplication {
       return;
     }
     if (this.layoutMode === "continuous") {
-      if (touch.intent === "undecided" && distance(touch.start, touch.latest) <= TAP_MOVEMENT && elapsedMs < 400) {
+      if (touch.intent === "undecided" && distance(touch.start, touch.latest) <= TAP_MOVEMENT_PX && elapsedMs < TAP_MAX_DURATION_MS) {
         if (!dismissedSelection) await this.handleTap({ at: performance.now(), point: touch.latest });
       } else if (touch.intent === "continuous-pan") {
         if (!this.startContinuousMomentum(touch.continuousVelocity)) {
@@ -1164,7 +1250,7 @@ export class ReaderApplication {
       }
       return;
     }
-    if (touch.intent === "undecided" && distance(touch.start, touch.latest) <= TAP_MOVEMENT && elapsedMs < 400) {
+    if (touch.intent === "undecided" && distance(touch.start, touch.latest) <= TAP_MOVEMENT_PX && elapsedMs < TAP_MAX_DURATION_MS) {
       if (!dismissedSelection) await this.handleTap({ at: performance.now(), point: touch.latest });
       return;
     }
@@ -1179,10 +1265,41 @@ export class ReaderApplication {
 
   private onTouchCancel(event: TouchEvent): void {
     if (this.singleTouch || this.bufferedPageTouch || this.pinchTouch) event.preventDefault();
+    const pinch = this.pinchTouch;
     this.cancelTouches();
+    if (pinch) this.recoverFromInterruptedPinch(pinch);
     this.cancelLongPress();
     this.selectionTouch = undefined;
     this.pendingSelectionDismissal = undefined;
+  }
+
+  /**
+   * Returns the scene to a legal resting state after a pinch ends without a
+   * normal touchend (system gesture cancel, or a third finger). Without this a
+   * reading page could stay shrunk below fit with the grid layer still shown.
+   */
+  private recoverFromInterruptedPinch(pinch: PinchTouch): void {
+    this.gridGesture = undefined;
+    if (this.viewMode === "grid") {
+      this.semanticZoom = GRID_REST_SCALE;
+      this.camera = { x: 0, y: 0, scale: 1 };
+      this.fit = "page";
+      if (this.gridLayout) this.gridOffset = constrainGridOffset(this.gridOffset, this.gridLayout, this.viewport(), this.safeInsets());
+      this.gridLayer.hidden = false;
+      this.applyTransform();
+      this.syncGridThumbnails();
+      return;
+    }
+    this.semanticZoom = 1;
+    if (pinch.viewMode === "reading" && pinch.camera.scale >= 1 && this.currentLayout) {
+      this.camera = constrainCamera(pinch.camera, this.cameraBoundsLayout() ?? this.currentLayout, this.viewport(), this.safeInsets());
+      if (this.camera.scale <= FIT_SCALE_TOLERANCE) this.setPageFit();
+    } else {
+      this.setPageFit();
+    }
+    this.gridLayer.hidden = true;
+    this.applyTransform();
+    void this.refreshRendering().catch((error) => console.warn("Rendering after an interrupted pinch failed", error));
   }
 
   private startBufferedPageTouch(event: TouchEvent): void {
@@ -1191,7 +1308,7 @@ export class ReaderApplication {
       || this.queuedPageTurn
       || this.viewMode !== "reading"
       || this.layoutMode === "continuous"
-      || this.camera.scale > 1.01) return;
+      || this.camera.scale > FIT_SCALE_TOLERANCE) return;
     if (event.touches.length !== 1) {
       this.bufferedPageTouch = undefined;
       return;
@@ -1228,14 +1345,14 @@ export class ReaderApplication {
     const delta = { x: current.x - touch.start.x, y: current.y - touch.start.y };
     touch.latest = current;
     touch.lastMovedAt = movedAt;
-    if (Math.hypot(delta.x, delta.y) < 8) return;
-    if (Math.abs(delta.x) <= Math.abs(delta.y) * 1.15) {
+    if (Math.hypot(delta.x, delta.y) < DRAG_ACTIVATION_PX) return;
+    if (Math.abs(delta.x) <= Math.abs(delta.y) * AXIS_DOMINANCE_RATIO) {
       this.bufferedPageTouch = undefined;
       return;
     }
     touch.intent = "page-turn";
     const instantaneousVelocity = (current.x - previous.x) / movedIn;
-    touch.pageVelocity = touch.pageVelocity * 0.55 + instantaneousVelocity * 0.45;
+    touch.pageVelocity = touch.pageVelocity * (1 - PAGE_VELOCITY_SAMPLE_WEIGHT) + instantaneousVelocity * PAGE_VELOCITY_SAMPLE_WEIGHT;
   }
 
   private finishBufferedPageTouch(event: TouchEvent): void {
@@ -1280,7 +1397,7 @@ export class ReaderApplication {
         if (deferredAction === "defer-chrome") this.setChromeVisible(!this.chromeVisible);
         else void this.navigateFromEdgeTap(deferredAction === "defer-next-page" ? 1 : -1);
       }
-    }, 330);
+    }, CHROME_TAP_DELAY_MS);
   }
 
   private async navigateFromEdgeTap(direction: -1 | 1): Promise<void> {
@@ -1317,6 +1434,10 @@ export class ReaderApplication {
     this.bottomBar.classList.toggle("visible", shown);
     this.topBar.setAttribute("aria-hidden", String(!shown));
     this.bottomBar.setAttribute("aria-hidden", String(!shown));
+    // Hidden bars stay in the DOM for their slide transition; `inert` keeps
+    // keyboard focus and assistive technology out of them until shown.
+    this.topBar.inert = !shown;
+    this.bottomBar.inert = !shown;
     this.chromeBackdrop.hidden = !shown;
     this.root.classList.toggle("chrome-visible", shown);
     this.documentTabs.replaceChildren();
@@ -1373,7 +1494,7 @@ export class ReaderApplication {
   private async togglePageWidth(at: Point): Promise<void> {
     if (!this.currentLayout || this.layoutMode === "continuous") return;
     let animateToFit = false;
-    if (this.fit === "width" || this.camera.scale > 1.01) {
+    if (this.fit === "width" || this.camera.scale > FIT_SCALE_TOLERANCE) {
       animateToFit = true;
       this.track.classList.add("zoom-settling");
       this.setPageFit();
@@ -1386,7 +1507,7 @@ export class ReaderApplication {
     }
     this.applyTransform();
     if (animateToFit) {
-      await wait(this.reducedMotion() ? 1 : 180);
+      await wait(this.reducedMotion() ? 1 : SEMANTIC_SETTLE_MS);
       this.track.classList.remove("zoom-settling");
     }
     await this.refreshRendering();
@@ -1627,7 +1748,7 @@ export class ReaderApplication {
         }
         this.positionCanvas(canvas, layout, slot.slot * this.viewport().width);
         canvas.setAttribute("aria-label", `Page ${pageNumber} of ${document.pageCount}`);
-        const dpr = Math.min(Math.max(window.devicePixelRatio, 1), 2.5);
+        const dpr = rasterDpr(window.devicePixelRatio, PAGE_DPR_CAP);
         const rasterScale = slot.slot === 0 ? this.camera.scale : 1;
         const rasterMultiplier = boundedRasterMultiplier(layout.width, layout.height, rasterScale, dpr);
         const directionalPriority = slot.slot === 0 ? 0 : slot.slot === preferredDirection ? 2 : 3;
@@ -1644,7 +1765,7 @@ export class ReaderApplication {
     }
     for (const [pageNumber, canvas] of this.spreadCanvases) {
       if (visible.has(pageNumber)) continue;
-      canvas.remove();
+      discardCanvas(canvas);
       this.spreadCanvases.delete(pageNumber);
     }
     this.camera = constrainCamera(this.camera, this.cameraBoundsLayout() ?? this.currentLayout, this.viewport(), this.safeInsets());
@@ -1663,7 +1784,7 @@ export class ReaderApplication {
     const visible = new Set(pages.map((page) => page.pageNumber));
     for (const [pageNumber, canvas] of this.continuousCanvases) {
       if (visible.has(pageNumber)) continue;
-      canvas.remove();
+      discardCanvas(canvas);
       this.continuousCanvases.delete(pageNumber);
     }
     const specs: PageRenderSpec[] = [];
@@ -1677,7 +1798,7 @@ export class ReaderApplication {
       canvas.style.left = `${pageLayout.x}px`;
       canvas.style.top = `${pageLayout.y}px`;
       canvas.setAttribute("aria-label", `Page ${pageLayout.pageNumber} of ${document.pageCount}`);
-      const dpr = Math.min(Math.max(window.devicePixelRatio, 1), 2);
+      const dpr = rasterDpr(window.devicePixelRatio, CONTINUOUS_DPR_CAP);
       specs.push({
         pageNumber: pageLayout.pageNumber,
         canvas,
@@ -1708,7 +1829,7 @@ export class ReaderApplication {
       return;
     }
     this.positionCanvas(canvas, layout, slotOffset);
-    const dpr = Math.min(Math.max(window.devicePixelRatio, 1), 2.5);
+    const dpr = rasterDpr(window.devicePixelRatio, PAGE_DPR_CAP);
     const rasterMultiplier = boundedRasterMultiplier(layout.width, layout.height, rasterScale, dpr);
     specs.push({
       pageNumber: page,
@@ -1752,7 +1873,7 @@ export class ReaderApplication {
 
   private settleMotion(from: number, to: number, releaseVelocity: number): { durationMilliseconds: number; initialControlY: number } {
     return this.reducedMotion()
-      ? { durationMilliseconds: 1, initialControlY: 0.28 }
+      ? { ...REDUCED_MOTION_SETTLE }
       : pageSettleMotion(from, to, releaseVelocity);
   }
 
@@ -1831,7 +1952,7 @@ export class ReaderApplication {
     this.persistenceTimer = window.setTimeout(() => {
       this.persistenceTimer = undefined;
       void this.flushPosition();
-    }, 500);
+    }, POSITION_SAVE_DEBOUNCE_MS);
   }
 
   private async flushPosition(): Promise<void> {
@@ -1887,7 +2008,7 @@ export class ReaderApplication {
    * anything was dismissed. Full back-button ordering is PLAN_APK.md A3.
    */
   private dismissForemost(): boolean {
-    if (!this.findPanel.hidden || !this.morePanel.hidden || !this.drawerPanel.hidden || !this.annotationEditor.hidden) {
+    if (this.panels.isOpen()) {
       this.closePanels();
       return true;
     }
@@ -1899,9 +2020,14 @@ export class ReaderApplication {
   }
 
   private async onKeyDown(event: KeyboardEvent): Promise<void> {
+    if (event.key === "Tab" && this.panels.isOpen("note")) {
+      trapFocus(event, this.annotationEditor);
+      return;
+    }
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
       event.preventDefault();
-      this.openFind();
+      // Opening Find would close the note editor and discard the draft.
+      if (!this.panels.isOpen("note")) this.openFind();
       return;
     }
     if (event.key === "Escape") {
@@ -1928,8 +2054,11 @@ export class ReaderApplication {
         await this.refreshRendering();
         this.queuePositionSave();
       }
-    } else if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && this.viewMode === "reading" && this.layoutMode !== "continuous" && this.camera.scale <= 1.01) {
+    } else if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && this.viewMode === "reading" && this.layoutMode !== "continuous" && this.camera.scale <= FIT_SCALE_TOLERANCE) {
       event.preventDefault();
+      // Key repeat while a turn settles would restart it, so a held key only
+      // turned the page on release; repeats now wait for the settle to finish.
+      if (this.animating) return;
       await this.turnPage(event.key === "ArrowRight" ? 1 : -1);
     }
   }
@@ -1938,9 +2067,7 @@ export class ReaderApplication {
     if (!this.document) return;
     this.closePanels();
     this.setChromeVisible(false);
-    this.findPanel.hidden = false;
-    this.panelBackdrop.hidden = false;
-    this.findInput.focus();
+    this.panels.open("find", this.findInput);
     this.findInput.select();
   }
 
@@ -1948,28 +2075,36 @@ export class ReaderApplication {
     if (!this.document) return;
     this.closePanels();
     this.setChromeVisible(false);
-    this.morePanel.hidden = false;
-    this.panelBackdrop.hidden = false;
     this.renderChrome();
-    this.morePanel.querySelector<HTMLButtonElement>("button[data-layout]")?.focus();
+    this.panels.open("more", this.morePanel.querySelector<HTMLButtonElement>("button[data-layout]"));
+  }
+
+  private openDrawer(title: string): void {
+    this.closePanels();
+    this.drawerTitle.textContent = title;
+    this.drawerContent.replaceChildren();
+    this.panels.open("drawer", required<HTMLButtonElement>(this.root, "#drawer-close"));
   }
 
   private closePanels(): void {
     this.cancelPanelMomentum();
     this.cancelContinuousMomentum();
     this.panelScrollTouch = undefined;
-    if (!this.findPanel.hidden) {
-      this.searchGenerations.cancel();
-      if (this.searchInputTimer !== undefined) window.clearTimeout(this.searchInputTimer);
-      this.searchInputTimer = undefined;
-    }
-    this.findPanel.hidden = true;
-    this.morePanel.hidden = true;
-    this.drawerPanel.hidden = true;
-    this.annotationEditor.hidden = true;
-    this.editingNoteId = undefined;
-    this.panelBackdrop.hidden = true;
+    this.panels.close();
     if (this.selection) this.selectionActions.hidden = false;
+  }
+
+  /** Releases state owned by a panel once `PanelController` has closed it. */
+  private onPanelClosed(kind: PanelKind): void {
+    if (kind === "find") {
+      this.search.stop();
+    } else if (kind === "note") {
+      this.editingNoteId = undefined;
+      this.noteDraft = undefined;
+      this.annotationText.value = "";
+    } else if (kind === "drawer") {
+      this.pendingExport = undefined;
+    }
   }
 
   private async onMoreAction(event: Event): Promise<void> {
@@ -1985,6 +2120,8 @@ export class ReaderApplication {
       this.openAnnotations();
     } else if (button?.id === "export-open") {
       await this.exportAnnotatedCopy();
+    } else if (button?.id === "storage-open") {
+      await this.openStorage();
     }
   }
 
@@ -1992,7 +2129,7 @@ export class ReaderApplication {
     const sidecar = this.sidecar;
     if (!this.document || !sidecar || this.exporting) return;
     if (this.annotations.length === 0) {
-      this.showStatus("There are no annotations to export.", false, 2000);
+      this.showStatus("There are no annotations to export.", false, STATUS_MEDIUM_MS);
       return;
     }
     const annotations = [...this.annotations];
@@ -2006,22 +2143,69 @@ export class ReaderApplication {
       if (this.sidecar !== sidecar) return;
       const fileBuffer = new ArrayBuffer(result.bytes.byteLength);
       new Uint8Array(fileBuffer).set(result.bytes);
-      const blob = new Blob([fileBuffer], { type: "application/pdf" });
-      const file = new File([blob], result.fileName, { type: "application/pdf" });
-      await platform.deliverExport(file);
-      if (this.sidecar !== sidecar) return;
-      const skipped = result.skipped > 0 ? ` ${result.skipped} annotation${result.skipped === 1 ? "" : "s"} could not be placed.` : "";
-      this.showStatus(`Exported ${result.fileName}.${skipped}`, false, 2600);
+      const file = new File([fileBuffer], result.fileName, { type: "application/pdf" });
+      this.hideStatus();
+      // Safari only allows share() shortly after a tap, and preparing a large
+      // copy outlasts that window. Sharing therefore happens from a second,
+      // fresh tap on the Share button in this drawer.
+      this.openDrawer("Annotated copy ready");
+      this.pendingExport = { file, skipped: result.skipped, sidecarId: sidecar.id };
+      const summary = documentElement("p", "export-summary");
+      summary.textContent = result.skipped > 0
+        ? `${result.fileName} is ready. ${result.skipped} annotation${result.skipped === 1 ? "" : "s"} could not be placed.`
+        : `${result.fileName} is ready.`;
+      const share = documentElement("button", "export-share");
+      share.type = "button";
+      share.dataset.exportShare = "";
+      share.textContent = "Share annotated copy";
+      this.drawerContent.append(summary, share);
+      share.focus();
     } catch (error) {
       if (this.sidecar !== sidecar) return;
-      const name = error instanceof Error || error instanceof DOMException ? error.name : "";
-      if (name === "AbortError") {
-        this.hideStatus();
-        return;
-      }
       this.showStatus(`Unable to export annotated copy: ${errorMessage(error)}`, true);
     } finally {
       this.exporting = false;
+    }
+  }
+
+  private async sharePendingExport(): Promise<void> {
+    const pending = this.pendingExport;
+    if (!pending || pending.sidecarId !== this.sidecar?.id) return;
+    this.closePanels();
+    try {
+      await platform.deliverExport(pending.file);
+      this.showStatus(`Exported ${pending.file.name}.`, false, STATUS_LONG_MS);
+    } catch (error) {
+      if (errorName(error) === "AbortError") return;
+      this.showStatus(`Unable to share annotated copy: ${errorMessage(error)}`, true);
+    }
+  }
+
+  private async openStorage(): Promise<void> {
+    this.openDrawer("Storage");
+    this.drawerContent.textContent = "Measuring stored PDFs…";
+    try {
+      const [files, sidecars] = await Promise.all([listPdfs(), listRecentDocuments()]);
+      if (this.drawerPanel.hidden) return;
+      const report = storageReport(files, sidecars);
+      const rows: [string, string][] = [
+        ["Stored PDFs", `${report.fileCount} · ${formatBytes(report.totalBytes)}`],
+        ["Not referenced by any document", `${report.orphanIds.length} · ${formatBytes(report.orphanBytes)}`],
+        ["Duplicate imports of the same PDF", `${report.duplicateIds.length} · ${formatBytes(report.duplicateBytes)}`]
+      ];
+      const list = documentElement("dl", "storage-report");
+      for (const [label, value] of rows) {
+        const term = documentElement("dt", "storage-label");
+        term.textContent = label;
+        const detail = documentElement("dd", "storage-value");
+        detail.textContent = value;
+        list.append(term, detail);
+      }
+      const note = documentElement("p", "storage-note");
+      note.textContent = "This report is read-only. mreader never deletes stored PDFs.";
+      this.drawerContent.replaceChildren(list, note);
+    } catch (error) {
+      this.drawerContent.textContent = `Storage is unavailable: ${errorMessage(error)}`;
     }
   }
 
@@ -2053,89 +2237,6 @@ export class ReaderApplication {
     this.renderChrome();
   }
 
-  private async runSearch(): Promise<void> {
-    const document = this.document;
-    const query = this.findInput.value.trim();
-    if (this.searchInputTimer !== undefined) window.clearTimeout(this.searchInputTimer);
-    this.searchInputTimer = undefined;
-    this.searchGenerations.cancel();
-    this.searchHits = [];
-    this.activeSearchHit = -1;
-    this.pageHitLayer.replaceChildren();
-    this.continuousHitLayer.replaceChildren();
-    if (!document || !query) {
-      this.findSummary.textContent = "Enter text to search.";
-      this.findResults.replaceChildren();
-      return;
-    }
-    this.findSummary.textContent = `Scanning 0 of ${document.pageCount}…`;
-    this.findResults.replaceChildren();
-    try {
-      const result = await searchPages(
-        document.pageCount,
-        query,
-        (pageNumber) => document.pageText(pageNumber),
-        this.searchGenerations,
-        (progress) => {
-          if (document !== this.document) return;
-          this.findSummary.textContent = `Scanning ${progress.scanned} of ${progress.total} · ${progress.matchCount} matches`;
-        }
-      );
-      if (result.cancelled || document !== this.document) return;
-      this.searchHits = result.hits;
-      this.activeSearchHit = result.hits.length > 0 ? 0 : -1;
-      this.renderSearchResults();
-      this.findSummary.textContent = result.textPages === 0
-        ? `Scanned ${result.total} pages · no searchable text`
-        : `${result.matchCount} matches · ${result.total} pages scanned`;
-      if (this.activeSearchHit >= 0) await this.goToSearchHit(this.activeSearchHit);
-    } catch (error) {
-      this.findSummary.textContent = `Search failed: ${errorMessage(error)}`;
-    }
-  }
-
-  private renderSearchResults(): void {
-    this.findResults.replaceChildren();
-    this.searchHits.forEach((hit, index) => {
-      const item = documentElement("li", "find-result");
-      const button = documentElement("button", "find-result-button");
-      button.type = "button";
-      button.dataset.searchIndex = String(index);
-      button.setAttribute("aria-current", String(index === this.activeSearchHit));
-      const page = documentElement("strong", "find-result-page");
-      page.textContent = `Page ${hit.pageNumber}`;
-      const context = documentElement("span", "find-result-context");
-      context.textContent = hit.context;
-      button.append(page, context);
-      item.append(button);
-      this.findResults.append(item);
-    });
-  }
-
-  private async moveSearchHit(direction: -1 | 1): Promise<void> {
-    if (this.searchHits.length === 0) return;
-    const current = this.activeSearchHit < 0 ? 0 : this.activeSearchHit;
-    this.activeSearchHit = (current + direction + this.searchHits.length) % this.searchHits.length;
-    this.renderSearchResults();
-    await this.goToSearchHit(this.activeSearchHit);
-  }
-
-  private async selectSearchResult(event: Event): Promise<void> {
-    const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>("button[data-search-index]") : null;
-    const index = Number(button?.dataset.searchIndex);
-    if (!Number.isInteger(index) || index < 0 || index >= this.searchHits.length) return;
-    this.activeSearchHit = index;
-    this.renderSearchResults();
-    await this.goToSearchHit(index);
-  }
-
-  private async goToSearchHit(index: number): Promise<void> {
-    const hit = this.searchHits[index];
-    if (!hit) return;
-    await this.goToPage(hit.pageNumber);
-    await this.refreshHitOverlays();
-  }
-
   private async goToPage(pageNumber: number): Promise<void> {
     const document = this.document;
     if (!document) return;
@@ -2158,145 +2259,21 @@ export class ReaderApplication {
     this.queuePositionSave();
   }
 
+  /** Redraws every overlay for the pages on screen: annotations, links, and search hits. */
   private async refreshHitOverlays(): Promise<void> {
-    const document = this.document;
-    const generation = ++this.hitOverlayGeneration;
-    this.pageHitLayer.replaceChildren();
-    this.continuousHitLayer.replaceChildren();
     this.refreshAnnotationOverlays();
-    void this.refreshLinkOverlays();
-    if (!document || this.searchHits.length === 0) return;
-    const targets: { pageNumber: number; layout: PageLayout; layer: HTMLElement }[] = [];
-    if (this.layoutMode === "continuous" && this.continuousLayout) {
-      for (const layout of visibleContinuousPages(this.continuousLayout, this.continuousScroll, this.viewport(), 1)) {
-        targets.push({ pageNumber: layout.pageNumber, layout, layer: this.continuousHitLayer });
-      }
-    } else if ((this.layoutMode === "twoUp" || this.layoutMode === "twoUpCover") && this.document) {
-      for (const pageNumber of spreadPageNumbers(this.page, this.document.pageCount, this.layoutMode)) {
-        const layout = this.layouts.get(pageNumber);
-        if (layout) targets.push({ pageNumber, layout, layer: this.pageHitLayer });
-      }
-    } else if (this.currentLayout) {
-      targets.push({ pageNumber: this.page, layout: this.currentLayout, layer: this.pageHitLayer });
-    }
-    const visibleTargets = targets.filter((target) => this.searchHits.some((hit) => hit.pageNumber === target.pageNumber));
-    const texts = await Promise.all(visibleTargets.map(async (target) => ({ target, text: await document.pageText(target.pageNumber) })));
-    if (generation !== this.hitOverlayGeneration || document !== this.document) return;
-    for (const { target, text } of texts) {
-      const pageHits = this.searchHits.map((hit, index) => ({ hit, index })).filter(({ hit }) => hit.pageNumber === target.pageNumber);
-      for (const { hit, index } of pageHits) {
-        for (const segment of hit.segments) {
-          const item = text.items[segment.itemIndex];
-          if (!item) continue;
-          const normalizedLength = Math.max(1, normalizeSearchText(item.text).length);
-          const startFraction = segment.startOffset / normalizedLength;
-          const widthFraction = Math.max(0, segment.endOffset - segment.startOffset) / normalizedLength;
-          const marker = documentElement("div", "search-hit");
-          marker.classList.toggle("current", index === this.activeSearchHit);
-          marker.style.left = `${target.layout.x + (item.x + item.width * startFraction) * target.layout.width / Math.max(1, text.width)}px`;
-          marker.style.top = `${target.layout.y + item.y * target.layout.height / Math.max(1, text.height)}px`;
-          marker.style.width = `${Math.max(2, item.width * widthFraction * target.layout.width / Math.max(1, text.width))}px`;
-          marker.style.height = `${Math.max(2, item.height * target.layout.height / Math.max(1, text.height))}px`;
-          target.layer.append(marker);
-        }
-      }
-    }
-  }
-
-  private async refreshLinkOverlays(): Promise<void> {
-    const document = this.document;
-    const generation = ++this.linkOverlayGeneration;
-    this.pageLinkLayer.replaceChildren();
-    this.continuousLinkLayer.replaceChildren();
-    this.visiblePdfLinks.clear();
-    if (!document || this.viewMode !== "reading") return;
-    const layer = this.layoutMode === "continuous" ? this.continuousLinkLayer : this.pageLinkLayer;
-    const targets = this.visibleOverlayTargets().map(({ pageNumber, layout }) => ({ pageNumber, layout, layer }));
-    const pages = await Promise.all(targets.map(async (target) => {
-      try {
-        return { target, links: await document.pageLinks(target.pageNumber) };
-      } catch (error) {
-        console.warn(`Links on page ${target.pageNumber} are unavailable`, error);
-        return { target, links: [] };
-      }
-    }));
-    if (generation !== this.linkOverlayGeneration || document !== this.document || this.viewMode !== "reading") return;
-    for (const { target, links } of pages) {
-      links.forEach((link, index) => this.renderPdfLink(link, target.pageNumber, index, target.layout, target.layer, generation));
-    }
-  }
-
-  private renderPdfLink(
-    link: PdfLink,
-    sourcePage: number,
-    index: number,
-    layout: PageLayout,
-    layer: HTMLElement,
-    generation: number
-  ): void {
-    const key = `${generation}:${sourcePage}:${index}`;
-    this.visiblePdfLinks.set(key, { link, sourcePage });
-    const button = documentElement("button", "pdf-link");
-    button.type = "button";
-    button.dataset.pdfLink = key;
-    button.style.left = `${layout.x + link.rect.x * layout.width}px`;
-    button.style.top = `${layout.y + link.rect.y * layout.height}px`;
-    button.style.width = `${Math.max(1, link.rect.width * layout.width)}px`;
-    button.style.height = `${Math.max(1, link.rect.height * layout.height)}px`;
-    if (link.target.kind === "url") {
-      button.setAttribute("aria-label", `Open external PDF link: ${externalLinkLabel(link.target.url)}`);
-      button.title = link.target.url;
-    } else if (link.target.kind === "action") {
-      button.setAttribute("aria-label", pageActionLabel(link.target.action));
-    } else {
-      button.setAttribute("aria-label", "Follow internal PDF link");
-    }
-    layer.append(button);
-  }
-
-  private onPdfLinkAction(event: Event): void {
-    const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>("button[data-pdf-link]") : null;
-    const visible = button?.dataset.pdfLink ? this.visiblePdfLinks.get(button.dataset.pdfLink) : undefined;
-    if (!visible) return;
-    event.preventDefault();
-    event.stopPropagation();
-    this.clearPendingTap();
-    this.cancelTouches();
-    const { link } = visible;
-    if (link.target.kind === "url") {
-      if (window.confirm(`Open this external link?\n\n${link.target.url}`)) {
-        platform.openExternalUrl(link.target.url);
-      }
-      return;
-    }
-    void this.followInternalPdfLink(visible);
-  }
-
-  private async followInternalPdfLink({ link, sourcePage }: VisiblePdfLink): Promise<void> {
-    const document = this.document;
-    if (!document) return;
-    const targetPage = link.target.kind === "destination"
-      ? await document.resolveDestination(link.target.destination)
-      : link.target.kind === "action" ? pageForPdfAction(link.target.action, sourcePage, document.pageCount) : undefined;
-    if (document !== this.document) return;
-    if (!targetPage) {
-      this.showStatus("This PDF link destination is unavailable.", true, 2200);
-      return;
-    }
-    await this.goToPage(targetPage);
+    void this.links.refresh();
+    await this.search.refreshHits();
   }
 
   private clearSearch(): void {
-    this.searchGenerations.cancel();
-    this.hitOverlayGeneration += 1;
-    if (this.searchInputTimer !== undefined) window.clearTimeout(this.searchInputTimer);
-    this.searchInputTimer = undefined;
-    this.searchHits = [];
-    this.activeSearchHit = -1;
-    this.pageHitLayer.replaceChildren();
-    this.continuousHitLayer.replaceChildren();
-    this.findResults.replaceChildren();
-    this.findSummary.textContent = "Enter text to search.";
+    this.search.clear();
+  }
+
+  /** Visible pages paired with the layer their search-hit marks belong in. */
+  private searchTargets(): { pageNumber: number; layout: PageLayout; layer: HTMLElement }[] {
+    const layer = this.layoutMode === "continuous" ? this.continuousHitLayer : this.pageHitLayer;
+    return this.visibleOverlayTargets().map(({ pageNumber, layout }) => ({ pageNumber, layout, layer }));
   }
 
   private scheduleLongPress(touch: SingleTouch, point: Point): void {
@@ -2306,7 +2283,7 @@ export class ReaderApplication {
     this.longPressTimer = window.setTimeout(() => {
       this.longPressTimer = undefined;
       void this.beginTextSelection(touch, point, generation);
-    }, 480);
+    }, LONG_PRESS_MS);
   }
 
   private cancelLongPress(): void {
@@ -2325,13 +2302,13 @@ export class ReaderApplication {
       const position = characterHitTest(pageText, hit.normalized);
       const item = position ? pageText.items[position.itemIndex] : undefined;
       if (!position || !item) {
-        this.showStatus("No selectable text here.", false, 1600);
+        this.showStatus("No selectable text here.", false, STATUS_BRIEF_MS);
         return;
       }
       const end = { itemIndex: position.itemIndex, offset: Math.min(item.text.length, position.offset + 1) };
       const geometry = selectionRangeGeometry(pageText, position, end);
       if (!geometry) {
-        this.showStatus("No selectable text here.", false, 1600);
+        this.showStatus("No selectable text here.", false, STATUS_BRIEF_MS);
         return;
       }
       this.singleTouch = undefined;
@@ -2349,7 +2326,7 @@ export class ReaderApplication {
       this.clearPendingTap();
       this.refreshAnnotationOverlays();
     } catch (error) {
-      if (document === this.document) this.showStatus(`Text selection unavailable: ${errorMessage(error)}`, true, 2200);
+      if (document === this.document) this.showStatus(`Text selection unavailable: ${errorMessage(error)}`, true, STATUS_ERROR_MS);
     }
   }
 
@@ -2363,12 +2340,12 @@ export class ReaderApplication {
     this.selectionTouch = { mode, pageNumber: this.selection.pageNumber };
   }
 
-  private async updateSelectionAt(point: Point, mode: SelectionTouch["mode"]): Promise<void> {
+  private updateSelectionAt(point: Point, mode: SelectionTouch["mode"]): void {
     const selection = this.selection;
     if (!selection) return;
     const normalized = this.normalizedAtPage(point, selection.pageNumber);
     if (!normalized) return;
-    const position = characterHitTest(selection.pageText, normalized, 0.08);
+    const position = characterHitTest(selection.pageText, normalized, SELECTION_HIT_TOLERANCE);
     const item = position ? selection.pageText.items[position.itemIndex] : undefined;
     if (!position || !item) return;
     const afterCharacter = { itemIndex: position.itemIndex, offset: Math.min(item.text.length, position.offset + 1) };
@@ -2424,10 +2401,10 @@ export class ReaderApplication {
     if (!text) return;
     const copied = await writeClipboardText(text);
     if (!copied) {
-      this.showStatus("Copying text is unavailable here.", true, 2000);
+      this.showStatus("Copying text is unavailable here.", true, STATUS_MEDIUM_MS);
       return;
     }
-    this.showStatus("Copied selected text.", false, 1400);
+    this.showStatus("Copied selected text.", false, STATUS_SHORT_MS);
     this.cancelSelection();
   }
 
@@ -2448,16 +2425,18 @@ export class ReaderApplication {
     this.cancelSelection();
   }
 
-  private async persistAnnotation(annotation: Annotation): Promise<void> {
+  private async persistAnnotation(annotation: Annotation): Promise<boolean> {
     const sidecar = this.sidecar;
-    if (!sidecar || annotation.documentId !== sidecar.id) return;
+    if (!sidecar || annotation.documentId !== sidecar.id) return false;
     try {
       const stored = await putAnnotation(annotation);
-      if (sidecar !== this.sidecar) return;
+      if (sidecar !== this.sidecar) return true;
       this.annotations = orderAnnotations([...this.annotations.filter(({ id }) => id !== stored.id), stored]);
       this.refreshAnnotationOverlays();
+      return true;
     } catch (error) {
       this.showStatus(`Unable to save annotation: ${errorMessage(error)}`, true);
+      return false;
     }
   }
 
@@ -2465,40 +2444,42 @@ export class ReaderApplication {
     if (!annotation && !this.selection) return;
     this.closePanels();
     this.editingNoteId = annotation?.id;
+    // A new note keeps its own copy of the selected text, so rotation or any
+    // other selection cancellation while typing cannot discard the note.
+    this.noteDraft = annotation || !this.selection
+      ? undefined
+      : { documentId: this.sidecar?.id ?? "", pageNumber: this.selection.pageNumber, geometry: this.selection.geometry };
     this.annotationText.value = annotation?.body ?? "";
-    this.annotationEditor.hidden = false;
-    this.panelBackdrop.hidden = false;
+    this.panels.open("note", this.annotationText);
     this.selectionActions.hidden = true;
-    this.annotationText.focus();
   }
 
   private closeNoteEditor(restoreSelection = true): void {
-    this.annotationEditor.hidden = true;
-    this.editingNoteId = undefined;
-    this.annotationText.value = "";
-    if (this.findPanel.hidden && this.morePanel.hidden && this.drawerPanel.hidden) this.panelBackdrop.hidden = true;
+    if (this.panels.isOpen("note")) this.panels.close();
     if (restoreSelection && this.selection) this.selectionActions.hidden = false;
   }
 
   private async saveNote(): Promise<void> {
     const body = this.annotationText.value.trim();
     const existing = this.annotations.find((annotation): annotation is NoteAnnotation => annotation.id === this.editingNoteId && annotation.kind === "note");
+    const draft = this.noteDraft;
     let note: NoteAnnotation | undefined;
     if (existing) {
-      note = normalizeAnnotation({ ...existing, body, updatedAt: Date.now() }) as NoteAnnotation | undefined;
-    } else if (this.selection && this.sidecar) {
-      note = normalizeAnnotation({
-        ...annotationMetadata(this.sidecar.id, this.selection.pageNumber),
+      note = normalizeNote({ ...existing, body, updatedAt: Date.now() });
+    } else if (draft && draft.documentId === this.sidecar?.id) {
+      note = normalizeNote({
+        ...annotationMetadata(draft.documentId, draft.pageNumber),
         kind: "note",
         color: DEFAULT_NOTE_COLOR,
-        rects: this.selection.geometry.rects,
-        text: this.selection.geometry.text,
-        context: this.selection.geometry.context,
+        rects: draft.geometry.rects,
+        text: draft.geometry.text,
+        context: draft.geometry.context,
         body
-      }) as NoteAnnotation | undefined;
+      });
     }
-    if (!note || note.kind !== "note") return;
-    await this.persistAnnotation(note);
+    if (!note) return;
+    // Keep the editor and its text open if saving fails, so nothing is lost.
+    if (!await this.persistAnnotation(note)) return;
     this.closeNoteEditor(false);
     this.cancelSelection();
   }
@@ -2510,12 +2491,7 @@ export class ReaderApplication {
   }
 
   private openAnnotations(): void {
-    this.closePanels();
-    this.drawerPanel.hidden = false;
-    this.panelBackdrop.hidden = false;
-    this.drawerTitle.textContent = "Annotations";
-    this.drawerContent.replaceChildren();
-    required<HTMLButtonElement>(this.root, "#drawer-close").focus();
+    this.openDrawer("Annotations");
     if (this.annotations.length === 0) {
       this.drawerContent.textContent = "No annotations in this PDF.";
       return;
@@ -2648,7 +2624,7 @@ export class ReaderApplication {
 
   private renderInk(points: readonly InkPoint[], color: string, baseWidth: number, layout: PageLayout, layer: HTMLElement, className: string): void {
     if (points.length < 2) return;
-    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    const svg = document.createElementNS(SVG_NS, "svg");
     svg.setAttribute("class", className);
     svg.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
     svg.style.left = `${layout.x}px`;
@@ -2656,7 +2632,7 @@ export class ReaderApplication {
     svg.style.width = `${layout.width}px`;
     svg.style.height = `${layout.height}px`;
     for (const segment of inkSegments(points, baseWidth)) {
-      const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      const line = document.createElementNS(SVG_NS, "line");
       line.setAttribute("x1", String(segment.from.x * layout.width));
       line.setAttribute("y1", String(segment.from.y * layout.height));
       line.setAttribute("x2", String(segment.to.x * layout.width));
@@ -2682,7 +2658,7 @@ export class ReaderApplication {
       const previousCount = ink.points.length;
       const points = appendInkPoint(ink.points, {
         ...normalized,
-        pressure: sample.pressure > 0 ? sample.pressure : 0.5,
+        pressure: sample.pressure > 0 ? sample.pressure : DEFAULT_PEN_PRESSURE,
         elapsed: Math.max(0, sample.timeStamp - ink.startedAt)
       });
       firstChangedPoint = Math.min(firstChangedPoint, points.length < previousCount ? 1 : points.length === previousCount ? Math.max(0, points.length - 1) : previousCount);
@@ -2729,7 +2705,7 @@ export class ReaderApplication {
   }
 
   private mountLiveInkSurface(ink: InkState, layout: PageLayout, layer: HTMLElement): LiveInkSurface {
-    const element = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    const element = document.createElementNS(SVG_NS, "svg");
     element.setAttribute("class", "annotation-ink live");
     element.setAttribute("aria-hidden", "true");
     element.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
@@ -2745,7 +2721,7 @@ export class ReaderApplication {
   }
 
   private liveInkLine(from: InkPoint, to: InkPoint, layout: PageLayout): SVGLineElement {
-    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    const line = document.createElementNS(SVG_NS, "line");
     const segment = inkSegments([from, to], INK_BASE_WIDTH)[0];
     line.setAttribute("x1", String(from.x * layout.width));
     line.setAttribute("y1", String(from.y * layout.height));
@@ -2790,12 +2766,8 @@ export class ReaderApplication {
   private async openOutline(): Promise<void> {
     const document = this.document;
     if (!document) return;
-    this.closePanels();
-    this.drawerPanel.hidden = false;
-    this.panelBackdrop.hidden = false;
-    this.drawerTitle.textContent = "Outline";
+    this.openDrawer("Outline");
     this.drawerContent.textContent = "Loading outline…";
-    required<HTMLButtonElement>(this.root, "#drawer-close").focus();
     try {
       this.outlineNodes ??= await document.outline();
       if (document !== this.document) return;
@@ -2813,12 +2785,7 @@ export class ReaderApplication {
   }
 
   private openRecents(): void {
-    this.closePanels();
-    this.drawerPanel.hidden = false;
-    this.panelBackdrop.hidden = false;
-    this.drawerTitle.textContent = "Recents";
-    this.drawerContent.replaceChildren();
-    required<HTMLButtonElement>(this.root, "#drawer-close").focus();
+    this.openDrawer("Recents");
     if (this.recentSidecars.length === 0) {
       this.drawerContent.textContent = "No recent PDFs.";
       return;
@@ -2838,6 +2805,10 @@ export class ReaderApplication {
 
   private async onDrawerAction(event: Event): Promise<void> {
     const button = event.target instanceof Element ? event.target.closest<HTMLButtonElement>("button") : null;
+    if (button?.dataset.exportShare !== undefined) {
+      await this.sharePendingExport();
+      return;
+    }
     if (button?.dataset.outlineToggle !== undefined) {
       const row = button.closest<HTMLElement>(".outline-item");
       const group = button.parentElement?.nextElementSibling;
@@ -2855,7 +2826,7 @@ export class ReaderApplication {
     if (Number.isInteger(outlineIndex) && outlineIndex >= 0) {
       const item = this.flatOutline[outlineIndex];
       const page = item && this.document ? await this.document.resolveDestination(item.dest) : undefined;
-      if (!page) this.showStatus("This bookmark has no valid page destination.", true, 2200);
+      if (!page) this.showStatus("This bookmark has no valid page destination.", true, STATUS_ERROR_MS);
       else {
         this.closePanels();
         await this.goToPage(page);
@@ -2888,6 +2859,7 @@ export class ReaderApplication {
   }
 
   private async openRecent(id: string): Promise<void> {
+    if (this.opening) return;
     const sidecar = this.recentSidecars.find((item) => item.id === id);
     if (!sidecar) return;
     this.closePanels();
@@ -2898,6 +2870,7 @@ export class ReaderApplication {
     this.opening = true;
     this.showStatus(`Opening ${sidecar.name}…`);
     try {
+      await this.flushPosition();
       const bytes = await readPdf(id);
       const document = await PdfDocument.open(bytes, { id, name: sidecar.name, byteLength: sidecar.byteLength });
       await this.activate(document, sidecar);
@@ -2929,9 +2902,9 @@ export class ReaderApplication {
 
   private startContinuousMomentum(releaseVelocity: number): boolean {
     const layout = this.continuousLayout;
-    if (!layout || this.reducedMotion() || Math.abs(releaseVelocity) < 0.05) return false;
+    if (!layout || this.reducedMotion() || Math.abs(releaseVelocity) < CONTINUOUS_MOMENTUM_MIN_VELOCITY) return false;
     this.cancelContinuousMomentum();
-    let velocity = releaseVelocity * 1.4;
+    let velocity = releaseVelocity * CONTINUOUS_RELEASE_GAIN;
     let previousTime = performance.now();
     const advance = (time: number): void => {
       if (this.layoutMode !== "continuous" || this.viewMode !== "reading" || this.continuousLayout !== layout) {
@@ -3010,17 +2983,14 @@ export class ReaderApplication {
   }
 
   private clearLayoutCanvases(preserveSingle = false): void {
-    for (const canvas of this.spreadCanvases.values()) canvas.remove();
-    for (const canvas of this.continuousCanvases.values()) canvas.remove();
+    for (const canvas of this.spreadCanvases.values()) discardCanvas(canvas);
+    for (const canvas of this.continuousCanvases.values()) discardCanvas(canvas);
     this.spreadCanvases.clear();
     this.continuousCanvases.clear();
     this.continuousSyncedScroll = Number.NaN;
     this.continuousHitLayer.replaceChildren();
     this.pageHitLayer.replaceChildren();
-    this.linkOverlayGeneration += 1;
-    this.visiblePdfLinks.clear();
-    this.continuousLinkLayer.replaceChildren();
-    this.pageLinkLayer.replaceChildren();
+    this.links.clear();
     this.continuousAnnotationLayer.replaceChildren();
     this.pageAnnotationLayer.replaceChildren();
     if (!preserveSingle) {
@@ -3031,9 +3001,9 @@ export class ReaderApplication {
   }
 
   private startPanelMomentum(element: HTMLElement, releaseVelocity: number): void {
-    if (this.reducedMotion() || Math.abs(releaseVelocity) < 0.03) return;
+    if (this.reducedMotion() || Math.abs(releaseVelocity) < PANEL_MOMENTUM_MIN_VELOCITY) return;
     this.cancelPanelMomentum();
-    let velocity = releaseVelocity * 1.25;
+    let velocity = releaseVelocity * PANEL_RELEASE_GAIN;
     let previousTime = performance.now();
     const advance = (time: number): void => {
       if (!element.isConnected || this.findPanel.hidden && this.drawerPanel.hidden) {
@@ -3050,7 +3020,7 @@ export class ReaderApplication {
       previousTime = time;
       element.scrollTop = step.scrollTop;
       velocity = step.velocity;
-      if (step.reachedBoundary || Math.abs(velocity) < 0.015) {
+      if (step.reachedBoundary || Math.abs(velocity) < PANEL_MOMENTUM_STOP_VELOCITY) {
         this.panelMomentumFrame = undefined;
         return;
       }
@@ -3153,15 +3123,18 @@ export class ReaderApplication {
     this.syncGridThumbnails();
     this.gridLayer.classList.add("semantic-settling");
     this.track.classList.add("semantic-settling");
-    await nextFrame();
-    this.viewMode = "grid";
-    this.semanticZoom = GRID_REST_SCALE;
-    this.camera = { x: 0, y: 0, scale: 1 };
-    this.fit = "page";
-    this.applyTransform();
-    await wait(this.semanticSettleDuration());
-    this.gridLayer.classList.remove("semantic-settling");
-    this.track.classList.remove("semantic-settling");
+    try {
+      await nextFrame();
+      this.viewMode = "grid";
+      this.semanticZoom = GRID_REST_SCALE;
+      this.camera = { x: 0, y: 0, scale: 1 };
+      this.fit = "page";
+      this.applyTransform();
+      await wait(this.semanticSettleDuration());
+    } finally {
+      this.gridLayer.classList.remove("semantic-settling");
+      this.track.classList.remove("semantic-settling");
+    }
     this.renderChrome();
   }
 
@@ -3175,13 +3148,18 @@ export class ReaderApplication {
     this.setPageFit();
     this.gridLayer.classList.add("semantic-settling");
     this.track.classList.add("semantic-settling");
-    this.applyTransform();
-    await this.refreshRendering();
-    await wait(this.semanticSettleDuration());
-    this.gridLayer.classList.remove("semantic-settling");
-    this.track.classList.remove("semantic-settling");
-    this.gridLayer.hidden = true;
-    this.thumbnailRenderer.cancel();
+    try {
+      this.applyTransform();
+      await this.refreshRendering();
+      await wait(this.semanticSettleDuration());
+    } finally {
+      // Even if rendering fails, the reading view is current: never leave the
+      // grid layer visible or the settle transition class applied.
+      this.gridLayer.classList.remove("semantic-settling");
+      this.track.classList.remove("semantic-settling");
+      this.gridLayer.hidden = true;
+      this.thumbnailRenderer.cancel();
+    }
     this.queuePositionSave();
     this.renderChrome();
   }
@@ -3226,7 +3204,7 @@ export class ReaderApplication {
       x: itemCenter.x * gridCamera.scale + gridCamera.x,
       y: itemCenter.y * gridCamera.scale + gridCamera.y
     };
-    const thumbnailScale = Math.max(0.01, item.width * gridCamera.scale / Math.max(layout.width, 1));
+    const thumbnailScale = Math.max(MIN_TRANSITION_SCALE, item.width * gridCamera.scale / Math.max(layout.width, 1));
     const targetX = screenCenter.x - (layout.x + layout.width / 2) * thumbnailScale;
     const targetY = screenCenter.y - (layout.y + layout.height / 2) * thumbnailScale;
     this.camera = {
@@ -3249,7 +3227,7 @@ export class ReaderApplication {
       x: item.x + item.width / 2,
       y: item.y + item.height / 2
     };
-    const expandedScale = Math.max(0.01, layout.width * this.camera.scale / Math.max(item.width, 1));
+    const expandedScale = Math.max(MIN_TRANSITION_SCALE, layout.width * this.camera.scale / Math.max(item.width, 1));
     const expanded = {
       scale: expandedScale,
       x: pageCenter.x - itemCenter.x * expandedScale,
@@ -3278,7 +3256,7 @@ export class ReaderApplication {
     const visible = new Set(pages.map((page) => page.pageNumber));
     for (const [pageNumber, canvas] of this.thumbnailCanvases) {
       if (visible.has(pageNumber)) continue;
-      canvas.remove();
+      discardCanvas(canvas);
       this.thumbnailLabels.get(pageNumber)?.remove();
       this.thumbnailCanvases.delete(pageNumber);
       this.thumbnailLabels.delete(pageNumber);
@@ -3320,7 +3298,7 @@ export class ReaderApplication {
         canvas,
         cssWidth: page.width,
         cssHeight: page.height,
-        dpr: fullResolution ? Math.min(Math.max(window.devicePixelRatio, 1), 2) : 0.6,
+        dpr: fullResolution ? rasterDpr(window.devicePixelRatio, THUMBNAIL_DPR_CAP) : PREFETCH_THUMBNAIL_DPR,
         priority: (fullResolution ? 0 : viewport.width) + viewportDistance
       });
     }
@@ -3328,7 +3306,7 @@ export class ReaderApplication {
   }
 
   private clearThumbnailElements(): void {
-    for (const canvas of this.thumbnailCanvases.values()) canvas.remove();
+    for (const canvas of this.thumbnailCanvases.values()) discardCanvas(canvas);
     for (const label of this.thumbnailLabels.values()) label.remove();
     this.thumbnailCanvases.clear();
     this.thumbnailLabels.clear();
@@ -3337,9 +3315,9 @@ export class ReaderApplication {
 
   private startGridMomentum(releaseVelocity: number): boolean {
     const grid = this.gridLayout;
-    if (!grid || Math.abs(releaseVelocity) < 0.05) return false;
+    if (!grid || Math.abs(releaseVelocity) < GRID_MOMENTUM_MIN_VELOCITY) return false;
     this.cancelGridMomentum();
-    let velocity = releaseVelocity * 1.5;
+    let velocity = releaseVelocity * GRID_RELEASE_GAIN;
     let previousTime = performance.now();
     const advance = (time: number): void => {
       if (this.viewMode !== "grid" || this.gridLayout !== grid) {
@@ -3349,20 +3327,20 @@ export class ReaderApplication {
       const step = stepGridMomentum(this.gridOffset, velocity, time - previousTime);
       previousTime = time;
       const constrained = constrainGridOffset(step.offset, grid, this.viewport(), this.safeInsets());
-      const reachedBound = Math.abs(constrained - step.offset) > 0.1;
+      const reachedBound = Math.abs(constrained - step.offset) > GRID_BOUND_EPSILON_PX;
       this.gridOffset = constrained;
       velocity = step.velocity;
       if (reachedBound && !this.reducedMotion()) {
-        this.gridBounce = rubberBandDisplacement(step.offset - constrained + velocity * 12);
+        this.gridBounce = rubberBandDisplacement(step.offset - constrained + velocity * GRID_BOUNCE_PROJECTION_MS);
       }
       this.applyTransform();
       if (shouldRefreshGridWindow(this.gridOffset, this.gridSyncedOffset, this.viewport().width)) {
         this.syncGridThumbnails();
       }
-      if (reachedBound || Math.abs(velocity) < 0.02) {
+      if (reachedBound || Math.abs(velocity) < GRID_MOMENTUM_STOP_VELOCITY) {
         this.gridMomentumFrame = undefined;
-        if (reachedBound && Math.abs(this.gridBounce) > 0.01) {
-          this.startGridSpring(velocity * 0.15);
+        if (reachedBound && Math.abs(this.gridBounce) > GRID_REST_EPSILON_PX) {
+          this.startGridSpring(velocity * GRID_SPRING_HANDOFF);
           return;
         }
         this.syncGridThumbnails();
@@ -3417,7 +3395,7 @@ export class ReaderApplication {
   }
 
   private semanticSettleDuration(): number {
-    return this.reducedMotion() ? 1 : 180;
+    return this.reducedMotion() ? 1 : SEMANTIC_SETTLE_MS;
   }
 
   private reducedMotion(): boolean {
@@ -3425,128 +3403,3 @@ export class ReaderApplication {
   }
 }
 
-function required<T extends Element>(root: ParentNode, selector: string): T {
-  const element = root.querySelector<T>(selector);
-  if (!element) throw new Error(`Required reader element is missing: ${selector}`);
-  return element;
-}
-
-function documentElement<K extends keyof HTMLElementTagNameMap>(tag: K, className: string): HTMLElementTagNameMap[K] {
-  const element = document.createElement(tag);
-  element.className = className;
-  return element;
-}
-
-function renderOutlineList(items: readonly OutlineTreeItem[], indexes: ReadonlyMap<string, number>, root: boolean): HTMLUListElement {
-  const list = documentElement("ul", root ? "outline-list" : "outline-group");
-  list.setAttribute("role", root ? "tree" : "group");
-  for (const item of items) {
-    const row = documentElement("li", `outline-item${item.children.length > 0 ? " has-children" : ""}`);
-    row.setAttribute("role", "treeitem");
-    row.setAttribute("aria-level", String(item.level));
-    if (item.children.length > 0) row.setAttribute("aria-expanded", "true");
-    const line = documentElement("div", "outline-line");
-    if (item.children.length > 0) {
-      const disclosure = documentElement("button", "outline-disclosure");
-      disclosure.type = "button";
-      disclosure.dataset.outlineToggle = item.path.join("/");
-      disclosure.dataset.outlineTitle = item.title;
-      disclosure.setAttribute("aria-expanded", "true");
-      disclosure.setAttribute("aria-label", `Collapse ${item.title}`);
-      disclosure.textContent = "▾";
-      line.append(disclosure);
-    } else {
-      line.append(documentElement("span", "outline-disclosure-spacer"));
-    }
-    const button = documentElement("button", "outline-button");
-    button.type = "button";
-    const index = indexes.get(item.path.join("/"));
-    if (index !== undefined) button.dataset.outlineIndex = String(index);
-    button.textContent = item.title;
-    line.append(button);
-    row.append(line);
-    if (item.children.length > 0) row.append(renderOutlineList(item.children, indexes, false));
-    list.append(row);
-  }
-  return list;
-}
-
-/**
- * Copies text using the async clipboard when available, falling back to a
- * transient off-screen textarea for Safari configurations that reject
- * `navigator.clipboard` writes. Returns whether the copy succeeded.
- */
-async function writeClipboardText(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // Fall through to the legacy selection-based copy path.
-  }
-  const area = document.createElement("textarea");
-  area.value = text;
-  area.setAttribute("readonly", "");
-  area.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;-webkit-user-select:text;user-select:text";
-  document.body.append(area);
-  try {
-    area.select();
-    area.setSelectionRange(0, text.length);
-    return document.execCommand("copy");
-  } catch {
-    return false;
-  } finally {
-    area.remove();
-  }
-}
-
-function touchPoint(touch: Touch | undefined): Point | undefined {
-  return touch ? { x: touch.clientX, y: touch.clientY } : undefined;
-}
-
-function touchPoints(touches: TouchList): [Point, Point] | undefined {
-  const first = touchPoint(touches[0]);
-  const second = touchPoint(touches[1]);
-  return first && second ? [first, second] : undefined;
-}
-
-function isControl(target: EventTarget | null): boolean {
-  return target instanceof Element && target.closest("button,input,[data-reader-control]") !== null;
-}
-
-function isTypingTarget(target: EventTarget | null): boolean {
-  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target instanceof HTMLElement && target.isContentEditable);
-}
-
-function pixelValue(value: string): number {
-  const parsed = Number.parseFloat(value);
-  return Number.isFinite(parsed) ? parsed : 0;
-}
-
-function wait(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
-}
-
-function nextFrame(): Promise<void> {
-  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function pageActionLabel(action: PdfLinkAction): string {
-  if (action === "FirstPage") return "Go to first PDF page";
-  if (action === "LastPage") return "Go to last PDF page";
-  return action === "NextPage" ? "Go to next PDF page" : "Go to previous PDF page";
-}
-
-function externalLinkLabel(url: string): string {
-  try {
-    const parsed = new URL(url);
-    return parsed.hostname || parsed.protocol.slice(0, -1);
-  } catch {
-    return "external destination";
-  }
-}

@@ -1,4 +1,5 @@
 {
+  "id": "./",
   "name": "mreader",
   "short_name": "mreader",
   "description": "A chromeless, on-device PDF reader",
@@ -35,7 +36,13 @@
       "src": "./icon.svg",
       "sizes": "any",
       "type": "image/svg+xml",
-      "purpose": "any maskable"
+      "purpose": "any"
+    },
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
     }
   ]
 }

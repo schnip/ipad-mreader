@@ -24,17 +24,28 @@ async function registerServiceWorker(): Promise<void> {
 
 async function deliverExport(file: File): Promise<void> {
   if (navigator.canShare?.({ files: [file] })) {
-    await navigator.share({ files: [file], title: file.name });
-  } else {
-    const url = URL.createObjectURL(file);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = file.name;
-    document.body.append(anchor);
-    anchor.click();
-    anchor.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    try {
+      await navigator.share({ files: [file], title: file.name });
+      return;
+    } catch (error) {
+      // Safari requires transient user activation for share(). If it expired
+      // (`NotAllowedError`), fall back to a download instead of failing.
+      if (!(error instanceof DOMException) || error.name !== "NotAllowedError") throw error;
+    }
   }
+  downloadFile(file);
+}
+
+function downloadFile(file: File): void {
+  const url = URL.createObjectURL(file);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = file.name;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  // Revoking synchronously can cancel the download in Safari.
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
 }
 
 function openExternalUrl(url: string): void {

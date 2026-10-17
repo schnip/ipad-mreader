@@ -1,3 +1,5 @@
+import { positive } from "./math";
+
 export interface Size {
   width: number;
   height: number;
@@ -255,21 +257,39 @@ export function visibleContinuousPages(
   const overscan = Math.max(0, overscanScreens) * Math.max(1, viewport.height);
   const minimum = scrollY - overscan;
   const maximum = scrollY + viewport.height + overscan;
-  return layout.pages.filter((page) => page.y + page.height >= minimum && page.y <= maximum);
+  // Pages are laid out top to bottom, so the visible window is contiguous.
+  const pages = layout.pages;
+  const result: NumberedPageLayout[] = [];
+  for (let index = firstIndex(pages.length, (i) => (pages[i]?.y ?? 0) + (pages[i]?.height ?? 0) >= minimum); index < pages.length; index += 1) {
+    const page = pages[index];
+    if (!page || page.y > maximum) break;
+    result.push(page);
+  }
+  return result;
 }
 
 export function continuousPageAtViewportCenter(layout: ContinuousLayout, scrollY: number, viewport: Size): number {
   const center = scrollY + viewport.height / 2;
-  let closest = layout.pages[0];
-  let distance = Number.POSITIVE_INFINITY;
-  for (const page of layout.pages) {
-    const nextDistance = Math.abs(page.y + page.height / 2 - center);
-    if (nextDistance < distance) {
-      closest = page;
-      distance = nextDistance;
-    }
+  const pages = layout.pages;
+  if (!Number.isFinite(center)) return pages[0]?.pageNumber ?? 1;
+  const centerOf = (index: number) => (pages[index]?.y ?? 0) + (pages[index]?.height ?? 0) / 2;
+  const after = firstIndex(pages.length, (index) => centerOf(index) >= center);
+  const before = after - 1;
+  // Ties go to the earlier page, matching a linear nearest-center scan.
+  const index = after >= pages.length || (before >= 0 && Math.abs(centerOf(before) - center) <= Math.abs(centerOf(after) - center)) ? before : after;
+  return pages[Math.max(0, index)]?.pageNumber ?? 1;
+}
+
+/** Smallest index in [0, length) satisfying a monotone predicate, else `length`. */
+function firstIndex(length: number, predicate: (index: number) => boolean): number {
+  let low = 0;
+  let high = length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (predicate(middle)) high = middle;
+    else low = middle + 1;
   }
-  return closest?.pageNumber ?? 1;
+  return low;
 }
 
 export function continuousScrollForPage(layout: ContinuousLayout, pageNumber: number, viewport: Size): number {
@@ -286,10 +306,6 @@ export function sameLayout(a: PageLayout, b: PageLayout, tolerance = 0.01): bool
     && Math.abs(a.width - b.width) <= tolerance
     && Math.abs(a.height - b.height) <= tolerance
     && Math.abs(a.scale - b.scale) <= tolerance;
-}
-
-function positive(value: number): number {
-  return Number.isFinite(value) && value > 0 ? value : 1;
 }
 
 function safeInsets(insets: Partial<Insets>): Insets {

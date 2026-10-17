@@ -1,4 +1,4 @@
-import { clamp } from "./scene";
+import { clamp, positive } from "./math";
 import type { Insets, Size } from "./layout";
 import type { Point } from "./scene";
 
@@ -205,29 +205,29 @@ export function gridOffsetForPage(
 
 export function visibleGridPages(
   layout: GridLayout,
-  offsetY: number,
+  offsetX: number,
   viewport: Size,
   overscanScreens = 1
 ): GridPageLayout[] {
   const overscan = Math.max(0, overscanScreens) * viewport.width;
   const minimumX = -overscan;
   const maximumX = viewport.width + overscan;
-  return layout.pages.filter((page) => page.x + offsetY + page.width >= minimumX && page.x + offsetY <= maximumX);
+  return layout.pages.filter((page) => page.x + offsetX + page.width >= minimumX && page.x + offsetX <= maximumX);
 }
 
 export function shouldRefreshGridWindow(
-  offsetY: number,
-  lastRenderedOffsetY: number,
-  viewportHeight: number,
+  offsetX: number,
+  lastRenderedOffsetX: number,
+  viewportWidth: number,
   refreshFraction = 0.5
 ): boolean {
-  if (!Number.isFinite(lastRenderedOffsetY)) return true;
-  const threshold = Math.max(1, Math.max(0, refreshFraction) * Math.max(1, viewportHeight));
-  return Math.abs(offsetY - lastRenderedOffsetY) >= threshold;
+  if (!Number.isFinite(lastRenderedOffsetX)) return true;
+  const threshold = Math.max(1, Math.max(0, refreshFraction) * Math.max(1, viewportWidth));
+  return Math.abs(offsetX - lastRenderedOffsetX) >= threshold;
 }
 
-export function gridPageAtPoint(layout: GridLayout, offsetY: number, point: Point): number | undefined {
-  const sceneX = point.x - offsetY;
+export function gridPageAtPoint(layout: GridLayout, offsetX: number, point: Point): number | undefined {
+  const sceneX = point.x - offsetX;
   const hit = layout.pages.find((page) => (
     sceneX >= page.x
     && sceneX <= page.x + page.width
@@ -237,11 +237,11 @@ export function gridPageAtPoint(layout: GridLayout, offsetY: number, point: Poin
   return hit?.pageNumber;
 }
 
-export function nearestGridPage(layout: GridLayout, offsetY: number, point: Point): number {
+export function nearestGridPage(layout: GridLayout, offsetX: number, point: Point): number {
   let nearest = layout.pages[0];
   let nearestDistance = Number.POSITIVE_INFINITY;
   for (const page of layout.pages) {
-    const distance = Math.hypot(point.x - (page.x + offsetY + page.width / 2), point.y - (page.y + page.height / 2));
+    const distance = Math.hypot(point.x - (page.x + offsetX + page.width / 2), point.y - (page.y + page.height / 2));
     if (distance < nearestDistance) {
       nearest = page;
       nearestDistance = distance;
@@ -275,8 +275,4 @@ function thumbnailSize(page: Size, maximumWidth: number, maximumHeight: number):
   const height = positive(page.height);
   const scale = Math.min(maximumWidth / width, maximumHeight / height);
   return { width: width * scale, height: height * scale };
-}
-
-function positive(value: number): number {
-  return Number.isFinite(value) && value > 0 ? value : 1;
 }

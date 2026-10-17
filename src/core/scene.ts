@@ -1,4 +1,7 @@
 import type { Insets, PageLayout, Size } from "./layout";
+import { clamp } from "./math";
+
+export { clamp };
 
 export interface Point {
   x: number;
@@ -13,10 +16,6 @@ export interface Camera {
 
 export const MIN_CAMERA_SCALE = 1;
 export const MAX_CAMERA_SCALE = 6;
-
-export function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(maximum, Math.max(minimum, value));
-}
 
 export function sceneToScreen(point: Point, camera: Camera): Point {
   return { x: point.x * camera.scale + camera.x, y: point.y * camera.scale + camera.y };

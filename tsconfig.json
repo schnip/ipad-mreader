@@ -21,5 +21,6 @@
       "@mreader/platform": ["./src/platform/web.ts"]
     }
   },
-  "include": ["src", "vite.config.ts", "capacitor.config.ts"]
+  "include": ["src", "vite.config.ts", "capacitor.config.ts"],
+  "exclude": ["src/device-report.ts", "src/interaction-probes.ts", "src/opfs-probe.ts", "src/pdf-probe.ts", "src/gesture-math.ts", "src/gesture-math.test.ts"]
 }

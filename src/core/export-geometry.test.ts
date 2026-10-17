@@ -68,4 +68,27 @@ describe("export geometry", () => {
     expect(userPointFromView([0, 0, 0, 0, 0, 0], { x: 1, y: 1 })).toBeUndefined();
     expect(userPointFromView([1, 0, 0, 1, 0, 0], { x: Number.NaN, y: 1 })).toBeUndefined();
   });
+
+  it("round-trips through an offset crop box at every quarter turn and stays inside it", () => {
+    const offsetBox = { x1: 30, y1: 40, x2: 642, y2: 832 };
+    for (const rotation of [0, 90, 180, 270]) {
+      const size = viewportSize(offsetBox, rotation);
+      for (const normalized of [{ x: 0, y: 0 }, { x: 1, y: 1 }, { x: 0.25, y: 0.6 }, { x: 0.9, y: 0.1 }]) {
+        const user = userPointFromNormalized(offsetBox, rotation, normalized);
+        if (!user) throw new Error("Expected a user-space point.");
+        expect(user.x).toBeGreaterThanOrEqual(30 - 1e-9);
+        expect(user.x).toBeLessThanOrEqual(642 + 1e-9);
+        expect(user.y).toBeGreaterThanOrEqual(40 - 1e-9);
+        expect(user.y).toBeLessThanOrEqual(832 + 1e-9);
+        const view = applyViewMatrix(viewportMatrix(offsetBox, rotation), user);
+        expect(view.x / size.width).toBeCloseTo(normalized.x);
+        expect(view.y / size.height).toBeCloseTo(normalized.y);
+      }
+      const rect = userRectFromNormalized(offsetBox, rotation, { x: 0, y: 0, width: 1, height: 1 });
+      expect(rect?.x).toBeCloseTo(30);
+      expect(rect?.y).toBeCloseTo(40);
+      expect(rect?.width).toBeCloseTo(612);
+      expect(rect?.height).toBeCloseTo(792);
+    }
+  });
 });

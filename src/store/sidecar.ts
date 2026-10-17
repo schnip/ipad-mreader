@@ -1,6 +1,8 @@
-import { clamp } from "../core/scene";
+import { clamp, finite, isRecord } from "../core/math";
 import { normalizeReaderLayout } from "../core/layout";
 import type { ReaderLayout } from "../core/layout";
+import { openDatabase, withStore } from "./idb";
+import type { DatabaseSpec } from "./idb";
 
 export type FitState = "page" | "width" | "custom";
 
@@ -25,9 +27,19 @@ export interface DocumentSidecar {
   fingerprint?: string;
 }
 
-const DATABASE_NAME = "mreader-sidecar";
-const DATABASE_VERSION = 1;
 const DOCUMENTS_STORE = "documents";
+
+const SIDECAR_DATABASE: DatabaseSpec = {
+  name: "mreader-sidecar",
+  version: 1,
+  label: "sidecar",
+  upgrade(database) {
+    if (!database.objectStoreNames.contains(DOCUMENTS_STORE)) {
+      const store = database.createObjectStore(DOCUMENTS_STORE, { keyPath: "id" });
+      store.createIndex("lastOpenedAt", "lastOpenedAt");
+    }
+  }
+};
 
 export function defaultReadingPosition(): ReadingPosition {
   return { version: 1, page: 1, fit: "page", scale: 1, centerX: 0.5, centerY: 0.5 };
@@ -96,79 +108,52 @@ export function dedupeRecentDocuments(sidecars: readonly DocumentSidecar[]): Doc
 }
 
 export async function putDocumentSidecar(sidecar: DocumentSidecar): Promise<void> {
-  const database = await openDatabase();
-  try {
-    const transaction = database.transaction(DOCUMENTS_STORE, "readwrite");
-    const complete = transactionComplete(transaction);
-    const request = transaction.objectStore(DOCUMENTS_STORE).put(normalizeDocumentSidecar(sidecar));
-    await requestResult(request);
-    await complete;
-  } finally {
-    database.close();
-  }
+  const normalized = normalizeDocumentSidecar(sidecar);
+  if (!normalized) throw new Error("The document sidecar is invalid: it needs a string id and name.");
+  await withStore(SIDECAR_DATABASE, DOCUMENTS_STORE, "readwrite", (store) => store.put(normalized));
 }
 
 export async function getDocumentSidecar(id: string): Promise<DocumentSidecar | undefined> {
-  const database = await openDatabase();
-  try {
-    const transaction = database.transaction(DOCUMENTS_STORE, "readonly");
-    const complete = transactionComplete(transaction);
-    const value = await requestResult(transaction.objectStore(DOCUMENTS_STORE).get(id));
-    await complete;
-    return normalizeDocumentSidecar(value);
-  } finally {
-    database.close();
-  }
+  const value: unknown = await withStore(SIDECAR_DATABASE, DOCUMENTS_STORE, "readonly", (store) => store.get(id));
+  return normalizeDocumentSidecar(value);
 }
 
 export async function listRecentDocuments(): Promise<DocumentSidecar[]> {
-  const database = await openDatabase();
-  try {
-    const transaction = database.transaction(DOCUMENTS_STORE, "readonly");
-    const complete = transactionComplete(transaction);
-    const values = await requestResult(transaction.objectStore(DOCUMENTS_STORE).getAll());
-    await complete;
-    return values
-      .map((value) => normalizeDocumentSidecar(value))
-      .filter((value): value is DocumentSidecar => value !== undefined)
-      .sort((a, b) => b.lastOpenedAt - a.lastOpenedAt);
-  } finally {
-    database.close();
-  }
+  const values: unknown[] = await withStore(SIDECAR_DATABASE, DOCUMENTS_STORE, "readonly", (store) => store.getAll());
+  return values
+    .map((value) => normalizeDocumentSidecar(value))
+    .filter((value): value is DocumentSidecar => value !== undefined)
+    .sort((a, b) => b.lastOpenedAt - a.lastOpenedAt);
 }
 
 export async function deleteDocumentSidecar(id: string): Promise<void> {
-  const database = await openDatabase();
-  try {
-    const transaction = database.transaction(DOCUMENTS_STORE, "readwrite");
-    const complete = transactionComplete(transaction);
-    const request = transaction.objectStore(DOCUMENTS_STORE).delete(id);
-    await requestResult(request);
-    await complete;
-  } finally {
-    database.close();
-  }
+  await withStore(SIDECAR_DATABASE, DOCUMENTS_STORE, "readwrite", (store) => store.delete(id));
 }
 
+/**
+ * Persists only the reading position. Recents order by `lastOpenedAt`, which is
+ * written when a document is opened, so turning pages does not reorder them.
+ */
 export async function updateReadingPosition(id: string, position: ReadingPosition): Promise<void> {
-  const database = await openDatabase();
+  const database = await openDatabase(SIDECAR_DATABASE);
   try {
     await new Promise<void>((resolve, reject) => {
       const transaction = database.transaction(DOCUMENTS_STORE, "readwrite");
       const store = transaction.objectStore(DOCUMENTS_STORE);
+      let failure: Error | undefined;
       transaction.oncomplete = () => resolve();
-      transaction.onabort = () => reject(transaction.error ?? new Error("Reading position transaction was aborted."));
+      transaction.onabort = () => reject(failure ?? transaction.error ?? new Error("Reading position transaction was aborted."));
       transaction.onerror = () => reject(transaction.error ?? new Error("Reading position transaction failed."));
       const read = store.get(id);
       read.onerror = () => reject(read.error ?? new Error("Unable to read the document sidecar."));
       read.onsuccess = () => {
         const sidecar = normalizeDocumentSidecar(read.result);
         if (!sidecar) {
+          failure = new Error(`No document sidecar exists for ${id}, so its reading position was not saved.`);
           transaction.abort();
           return;
         }
         sidecar.position = normalizeReadingPosition(position, sidecar.pageCount);
-        sidecar.lastOpenedAt = Date.now();
         store.put(sidecar);
       };
     });
@@ -177,42 +162,3 @@ export async function updateReadingPosition(id: string, position: ReadingPositio
   }
 }
 
-function openDatabase(): Promise<IDBDatabase> {
-  if (!("indexedDB" in globalThis)) return Promise.reject(new Error("IndexedDB is unavailable in this browser."));
-  return new Promise((resolve, reject) => {
-    const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
-    request.onerror = () => reject(request.error ?? new Error("Unable to open the sidecar database."));
-    request.onblocked = () => reject(new Error("The sidecar database upgrade is blocked by another app window."));
-    request.onupgradeneeded = () => {
-      const database = request.result;
-      if (!database.objectStoreNames.contains(DOCUMENTS_STORE)) {
-        const store = database.createObjectStore(DOCUMENTS_STORE, { keyPath: "id" });
-        store.createIndex("lastOpenedAt", "lastOpenedAt");
-      }
-    };
-    request.onsuccess = () => resolve(request.result);
-  });
-}
-
-function requestResult<T>(request: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed."));
-  });
-}
-
-function transactionComplete(transaction: IDBTransaction): Promise<void> {
-  return new Promise((resolve, reject) => {
-    transaction.oncomplete = () => resolve();
-    transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB transaction was aborted."));
-    transaction.onerror = () => reject(transaction.error ?? new Error("IndexedDB transaction failed."));
-  });
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function finite(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
