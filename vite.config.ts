@@ -30,10 +30,14 @@ function serviceWorkerManifest(): Plugin {
   };
 }
 
+// Capacitor shells. Each bundles its assets, so none registers a service worker.
+const NATIVE_MODES = new Set(["android", "ios"]);
+
 // Build-time platform selection. Only the aliased file joins the module graph,
-// so `--mode android` is the only build that can ever reach Capacitor imports.
+// so only the native modes (`--mode android`, `--mode ios`) can ever reach
+// Capacitor imports.
 function platformModule(mode: string): string {
-  const file = mode === "android" ? "./src/platform/native.ts" : "./src/platform/web.ts";
+  const file = NATIVE_MODES.has(mode) ? "./src/platform/native.ts" : "./src/platform/web.ts";
   return fileURLToPath(new URL(file, import.meta.url));
 }
 
@@ -51,7 +55,7 @@ export default defineConfig(({ mode }) => ({
       name: "mreader-build-number",
       apply: "build",
       closeBundle() {
-        if (mode !== "android") console.log(`mreader service-worker cache mreader-p6-${buildNumber}`);
+        if (!NATIVE_MODES.has(mode)) console.log(`mreader service-worker cache mreader-p6-${buildNumber}`);
         console.log(`mreader build ${buildNumber}`);
       }
     }

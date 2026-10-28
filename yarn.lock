@@ -93,6 +93,11 @@
   dependencies:
     "@capacitor/synapse" "^1.0.4"
 
+"@capacitor/ios@8.5.2":
+  version "8.5.2"
+  resolved "https://registry.yarnpkg.com/@capacitor/ios/-/ios-8.5.2.tgz#05f805fc6e4b0478156212f06a30862abae67a67"
+  integrity sha512-eOT2S67AfTFG7KN0T3oxwAajrJz4rSye+ODfvChiwrk0F/+kWufFM1qU6cDjGJUOfwdAoeuEpZyWHSwZlu4GFg==
+
 "@capacitor/share@8.0.2":
   version "8.0.2"
   resolved "https://registry.yarnpkg.com/@capacitor/share/-/share-8.0.2.tgz#afd27c8fe3c3993725723f5f0f894b3a8e126dcf"

@@ -13,6 +13,10 @@ OPFS and service workers require HTTPS. Do not use a plain LAN `http://` URL fro
 
 Each successful production build ends with `mreader build YYYYMMDDHHMMSS`; compare that value with the UTC build number exposed by the app.
 
+### iOS app via SideStore (scaffolding)
+
+`yarn build:ios` builds the web assets with the native platform seam (no service worker), and `yarn sync:ios` also runs `cap sync ios`. The IPA must be compiled on macOS: `.github/workflows/ios-ipa.yml` runs on a GitHub macOS runner (manually or on an `ios-v*` tag), builds `mreader-<build number>.ipa` unsigned, and attaches it to a Release on tag pushes. SideStore re-signs it on the iPad with a free Apple ID (7-day refresh). The wrapped app's OPFS/IndexedDB data is separate from the installed PWA. Ingress, export, and OPFS under `capacitor://` are not yet implemented or verified on iOS.
+
 On first launch, choose **Open PDF**. The selected bytes are copied into OPFS and remain on the device. Imports join an ordered open-document session and become current. Later launches restore only that explicit session—not every recent PDF—and restore each document's own page and camera position when selected. Closing a session tab does not delete its OPFS bytes or sidecar. To import another PDF while the controls are hidden, tap the nearly invisible dot in the safe top-right corner; its 44-point target is also keyboard-focusable. Pressing `O` opens the picker when a keyboard is connected.
 
 Installed Chromium PWAs on desktop register as PDF file handlers and import files received through **Open with**. On Android, Chromium does not expose PWA file handlers, but the installed app registers as a PDF share target: choose **Share → mreader** in the source app. iOS/iPadOS Safari currently supports neither PWA file handlers nor Web Share Targets, so **Open PDF** remains the required ingress there. All supported ingress paths copy the selected bytes into the same app-owned OPFS storage; they never modify the source file.
