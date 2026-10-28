@@ -2,14 +2,17 @@ import { App } from "@capacitor/app";
 import { AppLauncher } from "@capacitor/app-launcher";
 import type { Platform } from "./types";
 
+// Shared by the Android and iOS Capacitor shells (PLAN_APK.md, PLAN_IOS.md).
+
 function registerServiceWorker(): Promise<void> {
-  // Assets are bundled in the APK; a service worker adds nothing natively.
+  // Assets are bundled in the APK/IPA; a service worker adds nothing natively,
+  // and WKWebView does not run service workers on the capacitor:// scheme.
   return Promise.resolve();
 }
 
 function deliverExport(): Promise<void> {
-  // Implemented in PLAN_APK.md A3 (Filesystem cache + @capacitor/share).
-  return Promise.reject(new Error("Exporting an annotated copy is not yet supported on Android."));
+  // Implemented in PLAN_APK.md A3 (Filesystem cache + @capacitor/share), shared by iOS.
+  return Promise.reject(new Error("Exporting an annotated copy is not yet supported in the native app."));
 }
 
 function openExternalUrl(url: string): void {
@@ -20,6 +23,7 @@ function openExternalUrl(url: string): void {
 }
 
 function installBackHandler(dismissForemost: () => boolean): void {
+  // Android only: iOS has no back button, so this listener never fires there.
   void App.addListener("backButton", () => {
     if (!dismissForemost()) void App.exitApp();
   });

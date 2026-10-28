@@ -64,7 +64,7 @@ describe("native platform", () => {
 
   it("rejects export delivery clearly until A3 implements it", async () => {
     const file = new File([new Uint8Array([1])], "copy.pdf", { type: "application/pdf" });
-    await expect(platform.deliverExport(file)).rejects.toThrow("not yet supported on Android");
+    await expect(platform.deliverExport(file)).rejects.toThrow("not yet supported in the native app");
   });
 
   it("treats the service worker and A1 ingress as no-ops", async () => {
