@@ -1,5 +1,5 @@
 /// <reference types="vitest/config" />
-import { readFile, writeFile } from "node:fs/promises";
+import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
@@ -30,6 +30,42 @@ function serviceWorkerManifest(): Plugin {
   };
 }
 
+// pdf.js loads these at runtime: `wasm/` holds the JPEG 2000 (JPX) decoder,
+// without which pages built from JPX scans render blank; the others provide
+// standard fonts, CJK CMaps, and the CMYK ICC profile. They are served under
+// `pdfjs/` in dev and emitted into the bundle at build time, so the service
+// worker precaches them like any other emitted file.
+const PDFJS_ROOT = fileURLToPath(new URL("./node_modules/pdfjs-dist/", import.meta.url));
+const PDFJS_ASSET_DIRS = ["wasm", "standard_fonts", "cmaps", "iccs"];
+
+function pdfjsAssets(): Plugin {
+  return {
+    name: "mreader-pdfjs-assets",
+    configureServer(server) {
+      server.middlewares.use("/pdfjs", (request, response, next) => {
+        const [dir, file, ...rest] = decodeURIComponent((request.url ?? "").split("?")[0] ?? "").split("/").filter(Boolean);
+        if (!dir || !file || rest.length > 0 || !PDFJS_ASSET_DIRS.includes(dir) || file.startsWith(".")) {
+          next();
+          return;
+        }
+        readFile(join(PDFJS_ROOT, dir, file)).then((data) => {
+          if (file.endsWith(".wasm")) response.setHeader("Content-Type", "application/wasm");
+          else if (file.endsWith(".js")) response.setHeader("Content-Type", "text/javascript");
+          response.end(data);
+        }, () => next());
+      });
+    },
+    async generateBundle() {
+      for (const dir of PDFJS_ASSET_DIRS) {
+        for (const file of await readdir(join(PDFJS_ROOT, dir))) {
+          if (file.startsWith("LICENSE")) continue;
+          this.emitFile({ type: "asset", fileName: `pdfjs/${dir}/${file}`, source: await readFile(join(PDFJS_ROOT, dir, file)) });
+        }
+      }
+    }
+  };
+}
+
 // Capacitor shells. Each bundles its assets, so none registers a service worker.
 const NATIVE_MODES = new Set(["android", "ios"]);
 
@@ -50,6 +86,7 @@ export default defineConfig(({ mode }) => ({
     alias: [{ find: /^@mreader\/platform$/, replacement: platformModule(mode) }]
   },
   plugins: [
+    pdfjsAssets(),
     serviceWorkerManifest(),
     {
       name: "mreader-build-number",
