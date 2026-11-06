@@ -48,7 +48,7 @@ OPFS and sidecar stores, PDF wrapper, pure single-page layout, camera/scene tran
 
 ### P2 — semantic zoom (complete, including physical sign-off)
 
-Grid layout, worker-generated thumbnails, continuous threshold crossing during pinch, tap-to-jump, horizontal inertial scrolling, vertical/diagonal-vertical no-op, and rotation correction. The target-iPad pass and focused retest are complete; accepted grid-to-page smoothness polish is non-blocking.
+Grid layout, worker-generated thumbnails (a small hardware-scaled pool of dedicated thumbnail documents, and a persistent IndexedDB raster cache written only for measured-slow renders), continuous threshold crossing during pinch, tap-to-jump, horizontal inertial scrolling, vertical/diagonal-vertical no-op, and rotation correction. The target-iPad pass and focused retest are complete; accepted grid-to-page smoothness polish is non-blocking.
 
 ### P3 — chrome (complete, including physical sign-off)
 

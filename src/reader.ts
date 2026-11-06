@@ -13,8 +13,9 @@ import { SettledPageRenderer, boundedRasterMultiplier, rasterDpr } from "./core/
 import type { PageRenderSpec } from "./core/render";
 import { GRID_EXIT_SCALE, GRID_REST_SCALE, MIN_SEMANTIC_SCALE, gridLayerOpacity, interpolateSemanticTransform, readingLayerOpacity, semanticScale, semanticTransitionProgress, semanticViewMode } from "./core/semantic";
 import type { SemanticViewMode } from "./core/semantic";
-import { ThumbnailRenderer } from "./core/thumbs";
-import type { ThumbnailRenderSpec } from "./core/thumbs";
+import { ThumbnailRenderer, thumbnailCacheKey } from "./core/thumbs";
+import type { ThumbnailRenderSpec, ThumbnailSource } from "./core/thumbs";
+import { createThumbnailStore } from "./core/thumbcache";
 import { isViewControlActive } from "./core/view-controls";
 import { flattenOutline, outlineTreeStructure } from "./core/outline";
 import type { FlatOutlineItem, PdfOutlineNode } from "./core/outline";
@@ -31,7 +32,7 @@ import {
   PANEL_MOMENTUM_MIN_VELOCITY, PANEL_MOMENTUM_STOP_VELOCITY, PANEL_RELEASE_GAIN, PEN_TOUCH_SUPPRESSION_MS, POSITION_SAVE_DEBOUNCE_MS,
   PREFETCH_THUMBNAIL_DPR, REDUCED_MOTION_SETTLE, SCROLL_VELOCITY_SAMPLE_WEIGHT, SELECTION_HIT_TOLERANCE,
   SELECTION_TOUCH_PAD, SEMANTIC_SETTLE_MS, STATUS_BRIEF_MS, STATUS_DEFAULT_MS, STATUS_ERROR_MS, STATUS_LONG_MS, STATUS_MEDIUM_MS,
-  STATUS_SHORT_MS, TAP_MAX_DURATION_MS, TAP_MOVEMENT_PX, THUMBNAIL_DPR_CAP
+  STATUS_SHORT_MS, TAP_MAX_DURATION_MS, TAP_MOVEMENT_PX, THUMBNAIL_DPR_CAP, THUMBNAIL_TAB_CSS_HEIGHT, THUMBNAIL_TAB_CSS_WIDTH
 } from "./core/tuning";
 import { deletePdf, importPdf, listPdfs, readPdf, storageReport } from "./store/opfs";
 import { dedupeRecentDocuments, defaultReadingPosition, deleteDocumentSidecar, listRecentDocuments, putDocumentSidecar, updateReadingPosition } from "./store/sidecar";
@@ -164,6 +165,15 @@ export class ReaderApplication {
   private canvases: CanvasSet;
   private readonly renderer = new SettledPageRenderer();
   private readonly thumbnailRenderer = new ThumbnailRenderer();
+  // Tab-bar rasters are tiny and reuse the same persistent store; surfaces are
+  // kept so showing chrome never re-opens every tab's PDF.
+  private readonly tabThumbStore = createThumbnailStore();
+  private readonly tabThumbs = new ThumbnailRenderer(8, 1024 * 1024, undefined, { store: this.tabThumbStore });
+  private readonly tabThumbSurfaces = new Map<string, HTMLCanvasElement>();
+  private readonly tabThumbTargets = new Map<string, HTMLCanvasElement[]>();
+  private readonly tabThumbPending = new Set<string>();
+  private readonly tabThumbQueue: string[] = [];
+  private tabThumbPumping = false;
   private document?: PdfDocument;
   private sidecar?: DocumentSidecar;
   private page = 1;
@@ -1443,17 +1453,29 @@ export class ReaderApplication {
     this.chromeBackdrop.hidden = !shown;
     this.root.classList.toggle("chrome-visible", shown);
     this.documentTabs.replaceChildren();
-    for (const id of this.openSession.documentIds) {
+    const sessionIds = this.openSession.documentIds;
+    for (const id of sessionIds) {
       const sidecar = this.openSidecars.get(id);
       if (!sidecar) continue;
       const wrapper = documentElement("div", "document-tab");
       const select = documentElement("button", "document-select");
       select.type = "button";
       select.dataset.documentId = id;
-      select.textContent = sidecar.name;
       select.title = sidecar.name;
       select.setAttribute("role", "tab");
       select.setAttribute("aria-selected", String(this.openSession.currentId === id));
+      const thumb = documentElement("canvas", "document-tab-thumb");
+      thumb.hidden = true;
+      thumb.setAttribute("aria-hidden", "true");
+      const name = documentElement("span", "document-tab-name");
+      name.textContent = sidecar.name;
+      select.append(thumb, name);
+      const painted = this.tabThumbSurfaces.get(id);
+      if (painted) {
+        this.paintTabThumbnail(painted, thumb);
+      } else {
+        this.scheduleTabThumbnail(id, thumb);
+      }
       const close = documentElement("button", "document-close");
       close.type = "button";
       close.dataset.closeDocument = id;
@@ -1462,6 +1484,7 @@ export class ReaderApplication {
       wrapper.append(select, close);
       this.documentTabs.append(wrapper);
     }
+    this.pruneTabThumbnailState(sessionIds);
     for (const button of this.bottomBar.querySelectorAll<HTMLButtonElement>("button[data-view]")) {
       const control = button.dataset.view;
       if (control !== "page" && control !== "grid") continue;
@@ -1473,6 +1496,124 @@ export class ReaderApplication {
       const selected = normalizeReaderLayout(button.dataset.layout) === this.layoutMode;
       button.classList.toggle("active", selected);
       button.setAttribute("aria-checked", String(selected));
+    }
+  }
+
+  // --- Tab-bar first-page thumbnails ---------------------------------------
+
+  /** Raster box for the tab thumbnail; dpr follows the device, capped like grid thumbs. */
+  private tabThumbnailDpr(): number {
+    return rasterDpr(window.devicePixelRatio, THUMBNAIL_DPR_CAP);
+  }
+
+  private tabThumbnailKey(id: string): string {
+    return thumbnailCacheKey(id, { pageNumber: 1, cssWidth: THUMBNAIL_TAB_CSS_WIDTH, cssHeight: THUMBNAIL_TAB_CSS_HEIGHT, dpr: this.tabThumbnailDpr() });
+  }
+
+  private scheduleTabThumbnail(id: string, target: HTMLCanvasElement): void {
+    const targets = this.tabThumbTargets.get(id) ?? [];
+    targets.push(target);
+    this.tabThumbTargets.set(id, targets);
+    if (this.tabThumbPending.has(id)) return;
+    this.tabThumbPending.add(id);
+    this.tabThumbQueue.push(id);
+    void this.pumpTabThumbnails().catch((error) => console.warn("Tab thumbnails failed", error));
+  }
+
+  private async pumpTabThumbnails(): Promise<void> {
+    if (this.tabThumbPumping) return;
+    this.tabThumbPumping = true;
+    try {
+      while (this.tabThumbQueue.length > 0) {
+        const id = this.tabThumbQueue.shift() ?? "";
+        this.tabThumbPending.delete(id);
+        if (!this.openSession.documentIds.includes(id) || this.tabThumbSurfaces.has(id)) continue;
+        const surface = await this.tabThumbnailSurface(id).catch(() => undefined);
+        if (!surface) continue;
+        this.tabThumbSurfaces.set(id, surface);
+        for (const target of this.tabThumbTargets.get(id) ?? []) {
+          if (target.isConnected) this.paintTabThumbnail(surface, target);
+        }
+      }
+    } finally {
+      this.tabThumbPumping = false;
+    }
+  }
+
+  /**
+   * Builds (or loads from the persistent store) the page-1 raster for one open
+   * document. Otherwise-unopened documents are opened briefly, rendered, and
+   * destroyed again; the surface map keeps repeats cheap.
+   */
+  private async tabThumbnailSurface(id: string): Promise<HTMLCanvasElement | undefined> {
+    const surface = document.createElement("canvas");
+    surface.hidden = true;
+    // A stored raster renders without paying to open the document at all; the
+    // tab renderer itself would check the store, but only after an open.
+    if (await this.drawStoredTabThumbnail(id, surface)) return surface;
+    const sidecar = this.openSidecars.get(id);
+    if (!sidecar) return undefined;
+    const opened = await PdfDocument.open(await readPdf(id), { id, name: sidecar.name, byteLength: sidecar.byteLength });
+    try {
+      const spec: ThumbnailRenderSpec = {
+        pageNumber: 1,
+        canvas: surface,
+        cssWidth: THUMBNAIL_TAB_CSS_WIDTH,
+        cssHeight: THUMBNAIL_TAB_CSS_HEIGHT,
+        dpr: this.tabThumbnailDpr(),
+        priority: 0
+      };
+      await this.tabThumbs.settle(opened, [spec]);
+      return surface.hidden ? undefined : surface;
+    } finally {
+      await opened.destroy().catch(() => undefined);
+    }
+  }
+
+  private async drawStoredTabThumbnail(id: string, target: HTMLCanvasElement): Promise<boolean> {
+    if (!this.tabThumbStore) return false;
+    try {
+      const blob = await this.tabThumbStore.get(this.tabThumbnailKey(id));
+      if (!blob) return false;
+      const bitmap = await createImageBitmap(blob);
+      try {
+        this.paintTabThumbnail(bitmap, target);
+        return true;
+      } finally {
+        bitmap.close();
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  private paintTabThumbnail(source: ThumbnailSource, target: HTMLCanvasElement): void {
+    target.width = source.width;
+    target.height = source.height;
+    const context = target.getContext("2d", { alpha: false });
+    if (!context) throw new Error("A 2D canvas context is required to display a tab thumbnail.");
+    context.drawImage(source, 0, 0);
+    // Keep the raster's own aspect ratio; never stretch to the tab box.
+    const scale = Math.min(1, THUMBNAIL_TAB_CSS_WIDTH / source.width, THUMBNAIL_TAB_CSS_HEIGHT / source.height);
+    target.style.width = `${Math.round(source.width * scale)}px`;
+    target.style.height = `${Math.round(source.height * scale)}px`;
+    target.hidden = false;
+  }
+
+  private pruneTabThumbnailState(sessionIds: readonly string[]): void {
+    const live = new Set(sessionIds);
+    for (const id of [...this.tabThumbSurfaces.keys()]) {
+      if (!live.has(id)) {
+        discardCanvas(this.tabThumbSurfaces.get(id) as HTMLCanvasElement);
+        this.tabThumbSurfaces.delete(id);
+      }
+    }
+    for (const id of [...this.tabThumbTargets.keys()]) {
+      if (!live.has(id)) this.tabThumbTargets.delete(id);
+      else {
+        const targets = (this.tabThumbTargets.get(id) ?? []).filter((target) => target.isConnected);
+        this.tabThumbTargets.set(id, targets);
+      }
     }
   }
 

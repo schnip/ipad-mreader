@@ -63,6 +63,9 @@ export const CONTINUOUS_DPR_CAP = 2;
 export const THUMBNAIL_DPR_CAP = 2;
 /** Raster DPR of thumbnails prefetched outside the visible grid. */
 export const PREFETCH_THUMBNAIL_DPR = 0.6;
+/** Tab thumbnail display box (CSS px); rasters fit this box preserving aspect. */
+export const THUMBNAIL_TAB_CSS_WIDTH = 28;
+export const THUMBNAIL_TAB_CSS_HEIGHT = 36;
 
 /** Normalized distance a dragged selection may reach for the nearest character. */
 export const SELECTION_HIT_TOLERANCE = 0.08;

@@ -397,13 +397,31 @@ button { touch-action: none; }
 
 .document-select {
   min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   flex: 1;
   overflow: hidden;
-  padding: 0 10px;
+  padding: 0 8px 0 4px;
   text-align: left;
+}
+
+.document-tab-name {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.document-tab-thumb {
+  flex: 0 0 auto;
+  border: 1px solid rgb(255 255 255 / 18%);
+  border-radius: 3px;
+  background: rgb(255 255 255 / 8%);
+}
+
+.document-tab-thumb[hidden] { display: none; }
 
 .document-select[aria-selected="true"] { background: rgb(117 185 255 / 20%); }
 
