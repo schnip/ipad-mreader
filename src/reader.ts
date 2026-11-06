@@ -699,6 +699,7 @@ export class ReaderApplication {
     this.cancelTouches();
     this.renderer.cancel();
     this.thumbnailRenderer.cancel();
+    void this.thumbnailRenderer.releasePool();
     this.cancelGridMomentum();
     this.cancelContinuousMomentum();
     this.gridGeneration += 1;
@@ -740,6 +741,7 @@ export class ReaderApplication {
     const previousState = this.captureViewState();
     this.renderer.cancel();
     this.thumbnailRenderer.cancel();
+    void this.thumbnailRenderer.releasePool();
     this.cancelGridMomentum();
     this.cancelContinuousMomentum();
     this.gridGeneration += 1;
@@ -3302,7 +3304,12 @@ export class ReaderApplication {
         priority: (fullResolution ? 0 : viewport.width) + viewportDistance
       });
     }
-    void this.thumbnailRenderer.settle(document, specs);
+    void this.thumbnailRenderer.settle(document, specs, () => this.thumbnailBytes(document.descriptor.id));
+  }
+
+  /** Reads a fresh byte copy for a dedicated thumbnail worker; pdf.js owns it. */
+  private thumbnailBytes(documentId: string): Promise<Uint8Array> {
+    return readPdf(documentId);
   }
 
   private clearThumbnailElements(): void {

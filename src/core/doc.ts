@@ -1,5 +1,5 @@
 import { AnnotationType, GlobalWorkerOptions, getDocument } from "pdfjs-dist";
-import type { PDFDocumentLoadingTask, PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
+import type { PDFDocumentLoadingTask, PDFDocumentProxy, PDFPageProxy, PDFWorker, RenderTask } from "pdfjs-dist";
 import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import type { Size } from "./layout";
 import { errorMessage } from "./math";
@@ -75,9 +75,9 @@ export class PdfDocument {
   ) {}
 
   /** Opens `bytes`; pdf.js takes ownership of and transfers the buffer. */
-  static async open(bytes: Uint8Array, descriptor: PdfDescriptor): Promise<PdfDocument> {
+  static async open(bytes: Uint8Array, descriptor: PdfDescriptor, worker?: PDFWorker): Promise<PdfDocument> {
     if (bytes.byteLength === 0) throw new Error("The selected PDF is empty.");
-    const loadingTask = getDocument({ data: bytes, ...pdfjsAssetUrls(document.baseURI) });
+    const loadingTask = getDocument({ data: bytes, worker, ...pdfjsAssetUrls(document.baseURI) });
     try {
       const document = await loadingTask.promise;
       return new PdfDocument(descriptor, loadingTask, document);
